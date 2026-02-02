@@ -1,0 +1,33 @@
+# DeepAlpha Dependencies
+# Python >= 3.8
+
+# Deep Learning
+torch>=2.0.0
+numpy>=1.21.0
+einops>=0.6.0
+
+# Data Processing
+pandas>=1.3.0
+scipy>=1.7.0
+pyarrow>=8.0.0
+
+# Financial Data
+tushare>=1.2.85
+akshare>=1.10.0
+
+# Technical Analysis (optional)
+# pandas-ta>=0.3.14b
+
+# GUI
+PyQt6>=6.4.0
+pyqtgraph>=0.13.0
+qdarkstyle>=3.1.0
+
+# Utilities
+python-dotenv>=0.19.0
+matplotlib>=3.4.0
+schedule>=1.2.0
+
+# Optional: GPU support
+# torch-cuda (install separately based on your CUDA version)
+

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FinMamba Control Center</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>FinMamba <span style="font-weight: 300; opacity: 0.7;">AI</span></h1>
+            <div class="status-badge">
+                <div id="status-dot" class="status-dot active"></div>
+                <span id="status-text">System Ready</span>
+            </div>
+        </header>
+
+        <div class="grid">
+            <!-- Data Section -->
+            <div class="card">
+                <h2>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    Data Pipeline
+                </h2>
+                <p style="color: var(--text-secondary); margin-bottom: 2rem; flex-grow: 1;">Download latest market data and preprocess for training.</p>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                    <button id="btn-download" onclick="triggerAction('download')">Download</button>
+                    <button id="btn-preprocess" onclick="triggerAction('preprocess')" style="background: transparent; border: 1px solid rgba(255,255,255,0.1);">Process</button>
+                </div>
+            </div>
+
+            <!-- Training Section -->
+            <div class="card">
+                <h2>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+                    Model Training
+                </h2>
+                <p style="color: var(--text-secondary); margin-bottom: 2rem; flex-grow: 1;">Train the FinMamba model on processed data.</p>
+                <button id="btn-train" onclick="triggerAction('train')">Start Training</button>
+            </div>
+
+            <!-- Diagnose Section -->
+            <div class="card">
+                <h2>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    Stock Diagnosis
+                </h2>
+                <div style="margin-top: auto;">
+                    <input type="text" id="diagnose-input" placeholder="Code (e.g. 600000.SH)" onkeypress="handleEnter(event)">
+                    <button onclick="diagnoseStock()">Diagnose</button>
+                </div>
+                <div id="diagnosis-output" class="hidden diagnosis-result">
+                    <!-- Results will be injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Scan Results -->
+        <div class="card result-card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <h2>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+                    Daily Scan Results (Top 10)
+                </h2>
+                <button onclick="loadScan()" style="width: auto; padding: 0.5rem 1rem; font-size: 0.875rem;">Refresh Results</button>
+            </div>
+            <div style="overflow-x: auto;">
+                <table id="scan-table">
+                    <thead>
+                        <tr>
+                            <th>Code</th>
+                            <th>Date</th>
+                            <th>Score</th>
+                            <th>Magnitude</th>
+                            <th>Direction</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td colspan="5" style="text-align: center; color: var(--text-secondary); padding: 2rem;">Click Refresh to load data</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

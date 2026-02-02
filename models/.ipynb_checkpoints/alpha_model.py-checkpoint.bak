@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+"""
+AlphaModel - 高性能优化版
+针对 forward/backward 速度优化
+
+关键优化:
+1. 简化 FlattenHead (使用 pooling 替代 flatten)
+2. 减小 FFN 维度 (4x → 2x)
+3. 使用 Flash Attention (PyTorch 2.0+)
+4. 添加 Dropout 防止过拟合
+"""
+
+import math
+from typing import Tuple, Optional
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from config.config import Config
+
+
+class FastPatchEmbedding(nn.Module):
+    """
+    快速 Patch Embedding - 优化版
+    使用 Conv1d 替代 unfold 操作
+    """
+    
+    def __init__(
+        self,
+        seq_len: int = 60,
+        patch_len: int = 12,
+        stride: int = 8,
+        d_model: int = 128,
+        feature_dim: int = 48,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.patch_len = patch_len
+        self.stride = stride
+        self.d_model = d_model
+        self.feature_dim = feature_dim
+        
+        # 计算 patch 数量
+        self.num_patches = (seq_len - patch_len) // stride + 1
+        
+        # 使用 Conv1d 进行 patch 提取和投影 (更快)
+        self.patch_proj = nn.Conv1d(
+            in_channels=1,
+            out_channels=d_model,
+            kernel_size=patch_len,
+            stride=stride
+        )
+        
+        # 位置编码 (可学习)
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches, d_model)
+        )
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, seq_len, feature_dim)
+        Returns:
+            (B * feature_dim, num_patches, d_model)
+        """
+        B, L, C = x.shape
+        
+        # 重塑为 (B*C, 1, L) 用于 Conv1d
+        x = x.transpose(1, 2).reshape(B * C, 1, L)
+        
+        # Conv1d patch 提取: (B*C, d_model, num_patches)
+        x = self.patch_proj(x)
+        
+        # 转置为 (B*C, num_patches, d_model)
+        x = x.transpose(1, 2)
+        
+        # 添加位置编码
+        x = x + self.pos_embed
+        x = self.dropout(x)
+        x = self.norm(x)
+        
+        return x
+
+
+class FastTransformerEncoderLayer(nn.Module):
+    """
+    快速 Transformer Encoder - 优化版
+    
+    优化点:
+    1. FFN 维度减半 (4x → 2x)
+    2. 使用 scaled_dot_product_attention (Flash Attention)
+    3. Pre-LayerNorm 架构
+    """
+    
+    def __init__(
+        self,
+        d_model: int = 128,
+        n_heads: int = 4,
+        dropout: float = 0.2  # 增加 dropout 防止过拟合
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        
+        # Multi-Head Attention (使用 PyTorch 内置，支持 Flash Attention)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # FFN 维度减半 (4x → 2x) 提速 2x
+        d_ff = d_model * 2
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # Layer Normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, D)
+        Returns:
+            (B, L, D)
+        """
+        # Self-Attention with Pre-LayerNorm
+        x_norm = self.norm1(x)
+        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+        x = x + self.dropout(attn_out)
+        
+        # FFN with Pre-LayerNorm
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn(x_norm)
+        x = x + ffn_out
+        
+        return x
+
+
+class FastFlattenHead(nn.Module):
+    """
+    快速 Flatten Head - 优化版
+    
+    使用 AdaptiveAvgPool 替代 Flatten + Linear
+    大幅减少计算量
+    """
+    
+    def __init__(
+        self,
+        num_patches: int,
+        d_model: int = 128,
+        feature_dim: int = 48,
+        head_dropout: float = 0.2
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        
+        # 使用全局平均池化 (比 flatten 快很多)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        
+        # 简化的输出层
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(d_model // 2, 1)
+        )
+    
+    def forward(self, x: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Args:
+            x: (B * C, num_patches, d_model)
+            batch_size: Original batch size B
+        Returns:
+            (B, C)
+        """
+        # 全局平均池化: (B*C, d_model, num_patches) → (B*C, d_model, 1)
+        x = x.transpose(1, 2)  # (B*C, d_model, num_patches)
+        x = self.pool(x)  # (B*C, d_model, 1)
+        x = x.squeeze(-1)  # (B*C, d_model)
+        
+        # 输出层: (B*C, 1)
+        x = self.head(x)
+        
+        # Reshape 回 (B, C)
+        x = x.view(batch_size, self.feature_dim)
+        
+        return x
+
+
+class AlphaModel(nn.Module):
+    """
+    Alpha 预测模型 - 高性能优化版
+    
+    优化点:
+    1. 使用 FastPatchEmbedding (Conv1d)
+    2. 使用 FastTransformerEncoderLayer (FFN 2x, Flash Attention)
+    3. 使用 FastFlattenHead (AdaptiveAvgPool)
+    4. 增加 Dropout 防止过拟合
+    5. 简化输出层
+    """
+    
+    def __init__(
+        self,
+        seq_len: int = None,
+        feature_dim: int = None,
+        d_model: int = None,
+        n_heads: int = None,
+        n_layers: int = None,
+        patch_len: int = None,
+        stride: int = None,
+        dropout: float = 0.2,  # 增加默认 dropout
+        use_gat: bool = False
+    ):
+        super().__init__()
+        
+        # 使用配置或默认值
+        self.seq_len = seq_len or Config.SEQ_LEN
+        self.feature_dim = feature_dim or Config.FEATURE_DIM
+        self.d_model = d_model or Config.D_MODEL
+        self.n_heads = n_heads or Config.N_HEADS
+        self.n_layers = n_layers or Config.N_LAYERS
+        self.patch_len = patch_len or Config.PATCH_LEN
+        self.stride = stride or Config.STRIDE
+        self.dropout = dropout
+        self.use_gat = use_gat
+        
+        # Fast Patch Embedding
+        self.patch_embed = FastPatchEmbedding(
+            seq_len=self.seq_len,
+            patch_len=self.patch_len,
+            stride=self.stride,
+            d_model=self.d_model,
+            feature_dim=self.feature_dim,
+            dropout=self.dropout
+        )
+        
+        # Fast Transformer Backbone
+        self.transformer = nn.ModuleList([
+            FastTransformerEncoderLayer(
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                dropout=self.dropout
+            )
+            for _ in range(self.n_layers)
+        ])
+        self.norm = nn.LayerNorm(self.d_model)
+        
+        # Fast Flatten Head
+        self.flatten_head = FastFlattenHead(
+            num_patches=self.patch_embed.num_patches,
+            d_model=self.d_model,
+            feature_dim=self.feature_dim,
+            head_dropout=self.dropout
+        )
+        
+        # 简化的输出层 (不使用 GAT)
+        self.output_layer = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim // 4),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.feature_dim // 4, 1)
+        )
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, seq_len, feature_dim)
+        Returns:
+            (B, 1) - 预测分数
+        """
+        B = x.size(0)
+        
+        # Fast Patch Embedding: (B * C, num_patches, d_model)
+        x = self.patch_embed(x)
+        
+        # Fast Transformer
+        for layer in self.transformer:
+            x = layer(x)
+        x = self.norm(x)
+        
+        # Fast Flatten: (B, C)
+        x = self.flatten_head(x, B)
+        
+        # 输出层: (B, 1)
+        out = self.output_layer(x)
+        
+        return out
+    
+    def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        获取中间 embedding (用于相似股推荐)
+        
+        Returns:
+            (B, feature_dim)
+        """
+        B = x.size(0)
+        x = self.patch_embed(x)
+        for layer in self.transformer:
+            x = layer(x)
+        x = self.norm(x)
+        x = self.flatten_head(x, B)
+        return x
+
+
+def create_model(**kwargs) -> AlphaModel:
+    """便捷函数: 创建模型"""
+    return AlphaModel(**kwargs)
+
+
+if __name__ == "__main__":
+    # 测试模型
+    model = AlphaModel()
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 测试前向传播
+    x = torch.randn(4, 60, 48)
+    with torch.no_grad():
+        y = model(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {y.shape}")
+    
+    # 测试 GPU
+    if torch.cuda.is_available():
+        model = model.cuda()
+        x = x.cuda()
+        
+        # 测速
+        import time
+        model.eval()
+        with torch.no_grad():
+            # 预热
+            for _ in range(10):
+                _ = model(x)
+            
+            # 计时
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(100):
+                _ = model(x)
+            torch.cuda.synchronize()
+            elapsed = time.time() - start
+            
+        print(f"GPU test passed")
+        print(f"Throughput: {100 * 4 / elapsed:.0f} samples/s")
+        
+        # 显存占用
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        print(f"GPU memory: {allocated:.2f} MB")
