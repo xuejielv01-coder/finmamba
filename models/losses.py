@@ -76,8 +76,9 @@ class ICLoss(nn.Module):
     最大化预测与真实值的相关性
     """
     
-    def __init__(self):
+    def __init__(self, eps: float = 1e-8):
         super().__init__()
+        self.eps = eps
     
     def forward(
         self, 
@@ -101,21 +102,28 @@ class ICLoss(nn.Module):
         if target.dim() == 0:
             target = target.unsqueeze(0)
         
+        if pred.size(0) < 2:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
         # 标准化
         pred_mean = pred.mean()
         target_mean = target.mean()
-        pred_std = pred.std() + 1e-8
-        target_std = target.std() + 1e-8
         
-        pred_norm = (pred - pred_mean) / pred_std
-        target_norm = (target - target_mean) / target_std
+        pred_diff = pred - pred_mean
+        target_diff = target - target_mean
+        
+        pred_std = torch.sqrt(torch.mean(pred_diff**2) + self.eps)
+        target_std = torch.sqrt(torch.mean(target_diff**2) + self.eps)
         
         # 皮尔逊相关系数
-        ic = (pred_norm * target_norm).mean()
+        ic = torch.mean(pred_diff * target_diff) / (pred_std * target_std + self.eps)
         
+        # 检查 NaN
+        if torch.isnan(ic):
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+            
         # 返回负值 (最小化损失 = 最大化 IC)
-        return -ic
-
+        return -torch.clamp(ic, min=-1.0, max=1.0)
 
 
 class DirectionLoss(nn.Module):
@@ -141,10 +149,14 @@ class DirectionLoss(nn.Module):
         Returns:
             Direction loss
         """
-        # Hinge Loss: relu( -pred * sign(target) )
-        # 如果符号一致，loss为0
-        # 如果符号不一致，loss为 |pred|
-        return torch.mean(F.relu(-pred * torch.sign(target)))
+        # 将 target 映射到 [-1, 1]
+        target_sign = torch.sign(target)
+        
+        # Hinge Loss: relu( margin - pred * target_sign )
+        # 这里使用 0.1 作为 margin 鼓励更确定的预测
+        loss = F.relu(0.1 - pred * target_sign)
+        
+        return torch.mean(loss)
 
 
 class CombinedLoss(nn.Module):
@@ -249,8 +261,12 @@ class CombinedLoss(nn.Module):
         loss_dict['rank'] = sum(loss_dict[f'rank_{i+1}d'] for i in range(n_horizons)) / n_horizons
         loss_dict['ic'] = sum(loss_dict[f'ic_{i+1}d'] for i in range(n_horizons)) / n_horizons
         loss_dict['dir'] = sum(loss_dict[f'dir_{i+1}d'] for i in range(n_horizons)) / n_horizons
-        loss_dict['dir'] = sum(loss_dict[f'dir_{i+1}d'] for i in range(n_horizons)) / n_horizons
         
+        # 最后的 NaN 检查
+        if torch.isnan(total_loss):
+            total_loss = mse * 0.0  # 保持梯度流但重置值为0
+            loss_dict['total'] = 0.0
+            
         return total_loss, loss_dict
 
 
@@ -281,24 +297,33 @@ def calculate_ic(pred: torch.Tensor, target: torch.Tensor) -> float:
 
 def calculate_rank_ic(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
-    计算 RankIC (Spearman Correlation)
-    
-    Args:
-        pred: 预测值
-        target: 真实值
-    
-    Returns:
-        RankIC 值
+    计算 Rank IC (Spearman Correlation)
     """
-    pred = pred.detach().cpu().numpy().flatten()
-    target = target.detach().cpu().numpy().flatten()
-    
-    from scipy.stats import spearmanr
-    try:
-        # 检查输入是否为常量
-        if len(np.unique(pred)) == 1 or len(np.unique(target)) == 1:
-            return 0.0
-        rank_ic, _ = spearmanr(pred, target)
-        return rank_ic if not np.isnan(rank_ic) else 0.0
-    except:
+    if pred.size(0) < 2:
         return 0.0
+    
+    # 转换为 rank
+    pred_rank = pred.argsort().argsort().float()
+    target_rank = target.argsort().argsort().float()
+    
+    # 计算皮尔逊相关系数 (对 rank 而言就是 Spearman)
+    pred_rank = pred_rank - pred_rank.mean()
+    target_rank = target_rank - target_rank.mean()
+    
+    ic = (pred_rank * target_rank).sum() / (
+        torch.sqrt((pred_rank**2).sum() * (target_rank**2).sum()) + 1e-8
+    )
+    
+    return ic.item()
+
+
+def calculate_accuracy(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """
+    计算方向准确率 (Accuracy)
+    """
+    if pred.size(0) == 0:
+        return 0.0
+        
+    # 方向一致性
+    correct = (torch.sign(pred) == torch.sign(target)).float()
+    return correct.mean().item()

@@ -138,6 +138,107 @@ class SOTAMetrics:
                 group_returns[f'G{g+1}'] = np.mean(target[mask])
         
         return group_returns
+
+    @staticmethod
+    def calculate_group_returns(
+        pred: np.ndarray,
+        target: np.ndarray,
+        n_groups: int = 5
+    ) -> Dict[str, float]:
+        """
+        计算分层回测收益
+        """
+        df = pd.DataFrame({'pred': pred, 'target': target})
+        df['group'] = pd.qcut(df['pred'], n_groups, labels=False, duplicates='drop')
+        
+        group_ret = df.groupby('group')['target'].mean()
+        
+        # 单调性得分 (Spearman rank correlation)
+        from scipy.stats import spearmanr
+        monotone_score, _ = spearmanr(group_ret.index, group_ret.values)
+        
+        return {
+            'top_group_ret': group_ret.iloc[-1] if not group_ret.empty else 0,
+            'bottom_group_ret': group_ret.iloc[0] if not group_ret.empty else 0,
+            'spread': group_ret.iloc[-1] - group_ret.iloc[0] if len(group_ret) > 1 else 0,
+            'monotone_score': monotone_score
+        }
+
+    @staticmethod
+    def calculate_alpha_beta(
+        strategy_returns: pd.Series,
+        benchmark_returns: pd.Series,
+        risk_free_rate: float = 0.03
+    ) -> Dict[str, float]:
+        """
+        计算 Alpha 和 Beta
+        """
+        if len(strategy_returns) != len(benchmark_returns):
+            common_idx = strategy_returns.index.intersection(benchmark_returns.index)
+            strategy_returns = strategy_returns.loc[common_idx]
+            benchmark_returns = benchmark_returns.loc[common_idx]
+            
+        if len(strategy_returns) < 2:
+            return {'alpha': 0.0, 'beta': 0.0}
+            
+        # 年化无风险收益率转为日度
+        rf_daily = (1 + risk_free_rate) ** (1/252) - 1
+        
+        # 协方差和方差
+        matrix = np.cov(strategy_returns, benchmark_returns)
+        beta = matrix[0, 1] / matrix[1, 1] if matrix[1, 1] != 0 else 1.0
+        
+        # Alpha (Jensen's Alpha)
+        alpha = (strategy_returns.mean() - rf_daily) - beta * (benchmark_returns.mean() - rf_daily)
+        
+        return {
+            'alpha': alpha * 252,  # 年化 Alpha
+            'beta': beta
+        }
+
+    @staticmethod
+    def calculate_advanced_metrics(
+        strategy_returns: pd.Series,
+        benchmark_returns: pd.Series = None
+    ) -> Dict[str, float]:
+        """
+        计算高级金融指标
+        """
+        metrics = {}
+        
+        # 基础指标
+        total_ret = (1 + strategy_returns).prod() - 1
+        ann_ret = (1 + total_ret) ** (252 / len(strategy_returns)) - 1
+        vol = strategy_returns.std() * np.sqrt(252)
+        sharpe = ann_ret / (vol + 1e-8)
+        
+        metrics['annual_return'] = ann_ret
+        metrics['volatility'] = vol
+        metrics['sharpe_ratio'] = sharpe
+        
+        # 最大回撤
+        cum_ret = (1 + strategy_returns).cumprod()
+        running_max = cum_ret.cummax()
+        drawdown = (cum_ret - running_max) / running_max
+        metrics['max_drawdown'] = drawdown.min()
+        
+        # Calmar 比率
+        metrics['calmar_ratio'] = ann_ret / (abs(metrics['max_drawdown']) + 1e-8)
+        
+        if benchmark_returns is not None:
+            # Alpha / Beta
+            ab = SOTAMetrics.calculate_alpha_beta(strategy_returns, benchmark_returns)
+            metrics.update(ab)
+            
+            # 信息比率 (Information Ratio)
+            active_return = strategy_returns - benchmark_returns
+            tracking_error = active_return.std() * np.sqrt(252)
+            metrics['information_ratio'] = active_return.mean() * 252 / (tracking_error + 1e-8)
+            
+            # 胜率 (相对于基准)
+            metrics['outperformance_rate'] = (strategy_returns > benchmark_returns).mean()
+            
+        return metrics
     
     def check_monotonicity(
         self,

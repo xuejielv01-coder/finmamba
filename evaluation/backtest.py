@@ -152,6 +152,18 @@ class Backtester:
         # 加载基准
         self._add_benchmark()
         
+        # 计算高级金融指标 (Alpha, Beta, IR 等)
+        if 'daily_returns' in self.results and not self.results['daily_returns'].empty:
+            from evaluation.metrics import SOTAMetrics
+            
+            strategy_ret = self.results['daily_returns'].set_index('date')['return']
+            bench_ret = None
+            if 'benchmark' in self.results and not self.results['benchmark'].empty:
+                bench_ret = self.results['benchmark'].set_index('trade_date')['benchmark_return']
+            
+            adv_metrics = SOTAMetrics.calculate_advanced_metrics(strategy_ret, bench_ret)
+            self.results['metrics'].update(adv_metrics)
+        
         # 确保返回的结果字典包含必要的键，即使没有交易发生
         if 'daily_returns' not in self.results:
             # 创建空的 daily_returns DataFrame

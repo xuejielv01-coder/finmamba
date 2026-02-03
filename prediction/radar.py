@@ -181,54 +181,73 @@ class Radar:
             ind_id = self.industry_map.get(ts_code, 0)
             ind_ids = torch.tensor([ind_id], dtype=torch.long).to(self.device)
             
-            # 6. 推理
+            # 6. 推理 (带不确定性估计)
             with torch.no_grad():
-                # FinMamba input: (x, industry_ids)
-                model_output = self.model(X, ind_ids)
+                # 使用蒙特卡洛 Dropout 进行多次采样
+                pred_mean, pred_std = self.model.predict_with_uncertainty(X, ind_ids, n_samples=10)
                 
                 if return_embedding:
-                    self._embedding_cache[ts_code] = model_output.cpu().numpy().flatten()
+                    emb = self.model.get_embedding(X, ind_ids)
+                    self._embedding_cache[ts_code] = emb.cpu().numpy().flatten()
                     result['embedding'] = self._embedding_cache[ts_code].tolist()
                 
-                score = model_output.cpu().numpy().item()
+                # 取 1d 预测结果 (第一列)
+                score = pred_mean[0, 0].cpu().numpy().item()
+                uncertainty = pred_std[0, 0].cpu().numpy().item()
             
             # 7. 结果解析
             result['score'] = float(score)
+            result['uncertainty'] = float(uncertainty)
             
             # 高级技术分析
             close = stock_data['close'].iloc[-1]
+            ma5 = stock_data['close'].rolling(5).mean().iloc[-1]
             ma20 = stock_data['close'].rolling(20).mean().iloc[-1]
             ma60 = stock_data['close'].rolling(60).mean().iloc[-1]
             vol_ma5 = stock_data['vol'].rolling(5).mean().iloc[-1]
             
             technical_signals = []
-            if close > ma20: technical_signals.append("站上月线")
-            if ma20 > ma60: technical_signals.append("均线多头")
-            if stock_data['vol'].iloc[-1] > vol_ma5 * 1.5: technical_signals.append("放量")
+            if close > ma5 > ma20 > ma60: technical_signals.append("多头排列")
+            elif close > ma20: technical_signals.append("站上月线")
             
-            result['analysis'] = " | ".join(technical_signals) if technical_signals else "技术面弱势"
+            if stock_data['vol'].iloc[-1] > vol_ma5 * 2.0: technical_signals.append("放量突破")
+            elif stock_data['vol'].iloc[-1] < vol_ma5 * 0.5: technical_signals.append("缩量回调")
             
-            # 支撑/压力位 (简单估计)
+            # RSI 检查 (假设已计算)
+            if 'rsi_6' in processed.columns:
+                rsi = processed['rsi_6'].iloc[-1]
+                if rsi > 80: technical_signals.append("超买")
+                elif rsi < 20: technical_signals.append("超跌")
+            
+            result['analysis'] = " | ".join(technical_signals) if technical_signals else "震荡格局"
+            
+            # 支撑/压力位
             recent_high = stock_data['high'].tail(20).max()
             recent_low = stock_data['low'].tail(20).min()
             result['pressure'] = f"{recent_high:.2f}"
             result['support'] = f"{recent_low:.2f}"
 
-            # 综合决策
-            if score > 0.65 and close > ma20:
+            # 综合决策 (考虑不确定性)
+            # 置信度计算: 基于分数强度和预测稳定性
+            raw_confidence = min(abs(score) * 2, 1.0)
+            stability = 1.0 / (1.0 + uncertainty * 5.0) # 不确定性越小稳定性越高
+            confidence = raw_confidence * 0.7 + stability * 0.3
+            result['confidence'] = float(confidence)
+
+            if score > 0.4 and confidence > 0.6 and close > ma20:
                 result['direction'] = '强烈看涨'
                 result['action'] = 'BUY'
                 result['risk_level'] = 'low'
-            elif score > 0.55:
+            elif score > 0.15:
                 result['direction'] = '看涨'
                 result['action'] = 'ACCUMULATE'
                 result['risk_level'] = 'medium'
-            elif score < 0.4:
+            elif score < -0.3 and confidence > 0.6:
                 result['direction'] = '看跌'
                 result['action'] = 'SELL'
                 result['risk_level'] = 'high'
             else:
-                result['direction'] = '震荡'
+                result['direction'] = '中性/震荡'
                 result['action'] = 'HOLD'
                 result['risk_level'] = 'medium'
             

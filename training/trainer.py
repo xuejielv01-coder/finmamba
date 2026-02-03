@@ -137,12 +137,15 @@ class Trainer:
         else:
             self.model = model
         
-        # 暂时禁用torch.compile，避免apex依赖问题
-        # if torch.__version__ >= '2.0.0' and self.device.type == 'cuda':
-        #     # 使用reduce-overhead模式，更稳定且不依赖apex
-        #     self.model = torch.compile(self.model, mode='reduce-overhead')
-        
         self.model = self.model.to(self.device)
+        
+        # 启用 torch.compile (A800 建议开启)
+        if getattr(Config, 'ENABLE_COMPILE', False) and torch.__version__ >= '2.0.0' and self.device.type == 'cuda':
+            try:
+                logger.info("✓ 启用 torch.compile 模型加速")
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+            except Exception as e:
+                logger.warning(f"torch.compile 启用失败: {e}，将使用普通模式")
         
         # 数据加载器
         self.train_loader = train_loader
@@ -153,14 +156,21 @@ class Trainer:
         self.weight_decay = weight_decay or Config.WEIGHT_DECAY
         self.max_epochs = max_epochs or Config.MAX_EPOCHS
         self.patience = patience or Config.PATIENCE
-        self.use_amp = use_amp and torch.cuda.is_available()
+        self.use_amp = getattr(Config, 'USE_AMP', True) and torch.cuda.is_available()
+        self.amp_dtype = torch.bfloat16 if getattr(Config, 'USE_BF16', False) else torch.float16
         
-        # 优化器: AdamW
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay
-        )
+        # 优化器: AdamW (启用 fused=True 以在 A800 上获得最佳性能)
+        optimizer_kwargs = {
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+        }
+        # 检查是否支持 fused 参数 (PyTorch 2.0+)
+        import inspect
+        if 'fused' in inspect.signature(AdamW).parameters:
+            optimizer_kwargs['fused'] = True
+            logger.info("✓ 启用 Fused AdamW 优化器")
+            
+        self.optimizer = AdamW(self.model.parameters(), **optimizer_kwargs)
         
         # 调度器: CosineAnnealingLR + 学习率预热
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
@@ -282,7 +292,7 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)  # 使用set_to_none=True更高效
             
             # A10 GPU优化：使用统一的autocast上下文
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                 pred = self.model(X, industry_ids)  # 传入行业ID
                 loss, loss_dict = self.criterion(pred, y)
                 
@@ -384,7 +394,7 @@ class Trainer:
             y = y.float().to(self.device, non_blocking=True)  # 显式转换为float32
             
             # A10 GPU优化：验证时也使用混合精度
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                 pred = self.model(X, industry_ids)  # 传入行业ID
                 loss, loss_dict = self.criterion(pred, y)
             
@@ -411,7 +421,7 @@ class Trainer:
                             all_dates.append('')
                 # 忽略其他类型的info，如张量
         
-        # 计算 IC
+        # 计算 IC 和 Accuracy
         # 修复：避免修改只读张量，先将张量转换为numpy数组再处理
         all_preds_np = []
         all_targets_np = []
@@ -423,84 +433,38 @@ class Trainer:
                 batch_preds = all_preds[i].float().detach().cpu().numpy()
                 batch_targets = all_targets[i].float().detach().cpu().numpy()
                 
-                # 多期限输出处理: 确保只取第一列用于 IC 计算
-                # 情况1: (B, 3) -> 取 [:, 0] 得到 (B,)
-                # 情况2: (3,) 单样本 -> 取 [0] 得到标量
-                # 情况3: (B, 1) 或 (B,) -> squeeze 得到 (B,)
+                # 多期限输出处理
                 if batch_preds.ndim == 2:
                     if batch_preds.shape[1] > 1:
-                        batch_preds = batch_preds[:, 0]  # 多期限: 取第一列
+                        batch_preds = batch_preds[:, 0]
                     else:
                         batch_preds = batch_preds.squeeze()
-                elif batch_preds.ndim == 1 and len(batch_preds) == 3:
-                    # 单样本多期限输出 (3,) -> 取第一个值
-                    batch_preds = np.array([batch_preds[0]])
                 
                 batch_targets = batch_targets.flatten()
                 batch_preds = batch_preds.flatten()
                 
-                # 确保是 1D 数组且长度 > 0
-                if batch_preds.size > 0 and batch_targets.size > 0:
+                if batch_preds.size > 0:
                     all_preds_np.append(batch_preds)
                     all_targets_np.append(batch_targets)
             
-            # 合并为numpy数组（只有在有数据时）
             if all_preds_np:
                 all_preds_np = np.concatenate(all_preds_np)
                 all_targets_np = np.concatenate(all_targets_np)
             else:
                 all_preds_np = np.array([])
                 all_targets_np = np.array([])
-        else:
-            # 如果没有数据，初始化空数组
-            all_preds_np = np.array([])
-            all_targets_np = np.array([])
         
-        # 按日分组计算IC，然后取平均值
-        if all_dates and len(all_dates) == len(all_preds_np):
-            # 构建日期到预测/目标的映射
-            date_preds = {}
-            for date, pred, target in zip(all_dates, all_preds_np, all_targets_np):
-                if date not in date_preds:
-                    date_preds[date] = {'preds': [], 'targets': []}
-                date_preds[date]['preds'].append(pred)
-                date_preds[date]['targets'].append(target)
-            
-            # 计算每日IC
-            daily_ics = []
-            for date in date_preds:
-                daily_preds = np.array(date_preds[date]['preds'])
-                daily_targets = np.array(date_preds[date]['targets'])
-                # 确保至少有2个样本才能计算相关性
-                if len(daily_preds) > 1:
-                    # 转换为torch张量进行IC计算
-                    daily_ic = calculate_rank_ic(
-                        torch.tensor(daily_preds), 
-                        torch.tensor(daily_targets)
-                    )
-                    daily_ics.append(daily_ic)
-            
-            # 计算平均IC
-            if daily_ics:
-                val_ic = np.mean(daily_ics)
-                val_ic_std = np.std(daily_ics)
-            else:
-                val_ic = 0.0
-                val_ic_std = 0.0
-        else:
-            # 回退到传统计算方式
-            val_ic = calculate_rank_ic(
-                torch.tensor(all_preds_np), 
-                torch.tensor(all_targets_np)
-            )
-            val_ic_std = 0.0
+        # 计算全局 IC 和 Accuracy
+        from models.losses import calculate_accuracy
+        val_ic = calculate_rank_ic(torch.tensor(all_preds_np), torch.tensor(all_targets_np))
+        val_acc = calculate_accuracy(torch.tensor(all_preds_np), torch.tensor(all_targets_np))
         
         avg_loss = total_loss / max(n_batches, 1)
         
         return {
             'loss': avg_loss,
             'ic': val_ic,
-            'ic_std': val_ic_std,
+            'accuracy': val_acc,
             'samples': len(all_preds_np)
         }
     
@@ -570,6 +534,7 @@ class Trainer:
                     f"Epoch {epoch+1}/{self.max_epochs} | "
                     f"Loss: {train_metrics['loss']:.4f} | "
                     f"Val IC: {val_metrics['ic']:.4f} | "
+                    f"Val Acc: {val_metrics.get('accuracy', 0):.4f} | "
                     f"Speed: {samples_per_sec:.0f} samples/s | "
                     f"Time: {epoch_time:.1f}s | "
                     f"Elapsed: {elapsed_str} | "

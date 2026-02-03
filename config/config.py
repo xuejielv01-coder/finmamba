@@ -57,40 +57,47 @@ class Config:
     TRAIN_START_YEARS = 2  # 训练数据开始时间：当前日期往前推2年（改为2年）
     BACKTEST_START_MONTHS = 6  # 回测数据开始时间：当前日期往前推6个月
     
-    # ============ FinMamba Architecture (Optimized for A100 40GB) ============
-    SEQ_LEN = 60  # 增加回看天数，充分利用A100显存
-    FEATURE_DIM = 82  # 保持特征维度
-    D_MODEL = 256  # 增加模型隐藏维度，充分利用A100显存
-    N_LAYERS = 4  # 增加Mamba层数，充分利用A100显存
-    N_TRANSFORMER_LAYERS = 2  # 增加Transformer层数，充分利用A100显存
-    N_HEADS = 8  # 增加多头注意力头数 (确保256能被8整除)
-    D_STATE = 128  # 增加SSM状态维度，充分利用A100显存
-    D_CONV = 4  # SSM卷积核大小
-    EXPAND = 2  # SSM扩展因子
-    MAMBA_LEVELS = (1,)  # 只使用日级，平衡内存和性能
-    N_INDUSTRIES = 111  # 实际约111个行业
-    USE_GRAPH = True  # 启用行业嵌入，提高模型性能
-    N_GCN_LAYERS = 2  # 增加GCN层数，充分利用A100显存
-    PATCH_LEN = 8  # 增加patch长度
-    STRIDE = 6  # 增加stride
+    # ============ FinMamba Architecture (Optimized for A800 80GB) ============
+    SEQ_LEN = 60  
+    FEATURE_DIM = 85  
+    D_MODEL = 512  
+    N_LAYERS = 6  
+    N_TRANSFORMER_LAYERS = 4  
+    N_HEADS = 16  
+    D_STATE = 256  
+    D_CONV = 4  
+    EXPAND = 2  
+    MAMBA_LEVELS = (1, 5, 20)  
+    N_INDUSTRIES = 111  
+    USE_GRAPH = True  
+    N_GCN_LAYERS = 3  
+    PATCH_LEN = 8  
+    STRIDE = 4  
 
-    # ============ Training (Optimized for A100 40GB) ============
-    TRAIN_YEARS = 3  # 使用3年数据训练，充分利用A100显存
-    BATCH_SIZE = 128  # 增加batch size，充分利用A100显存
-    GRAD_ACCUM_STEPS = 1  # 减小梯度累积步数，充分利用A100显存
-    LR_INIT = 1e-4  # 学习率
-    WEIGHT_DECAY = 3e-3  # 权重衰减
-    MAX_EPOCHS = 100  # 增加训练轮数，提高模型性能
-    PATIENCE = 20  # 增加早停耐心值
-    DROPOUT = 0.2  # 适当减小dropout提高模型能力
-    SLIDE_STEP = 3  # 增加滑动窗口步长，平衡数据量和内存使用
+    # ============ Training (Optimized for A800 80GB & 96GB RAM) ============
+    TRAIN_YEARS = 5  # 增加训练数据量 (3 -> 5)
+    BATCH_SIZE = 2048  # 大幅增加 batch size (256 -> 2048)
+    GRAD_ACCUM_STEPS = 1  # A800 80GB 不需要梯度累积
+    LR_INIT = 1e-4  # 增加学习率以适应大 batch (5e-5 -> 1e-4)
+    WEIGHT_DECAY = 1e-2  
+    MAX_EPOCHS = 150  
+    PATIENCE = 30  
+    DROPOUT = 0.3  
+    SLIDE_STEP = 1  # 减小滑动窗口步长以产生更多样本 (2 -> 1)
+    
+    # 硬件加速开关
+    USE_AMP = True
+    USE_BF16 = True  # A800 完美支持 BF16
+    ENABLE_COMPILE = True  # 启用 torch.compile
+    PIN_MEMORY = True
+    NUM_WORKERS = 4  # Windows 建议 4-8
 
-    # ============ SOTA Thresholds (Adjusted for Strong Generalization) ============
-    SOTA_TARGET_IC = 0.055  # 降低目标 IC (0.06→0.055)
-    SOTA_MIN_IC = 0.02  # 降低最低 IC 阈值 (0.025→0.02)
-    SOTA_TARGET_ICIR = 0.55  # 降低目标 ICIR
-    SOTA_MIN_IC_SAVE = 0.04  # 降低保存模型的IC阈值 (0.045→0.04)
-    BAD_EPOCH_LIMIT = 10  # 减小bad epoch限制 (15→10)
+    # ============ SOTA Thresholds (Targeting IC > 0.2) ============
+    SOTA_TARGET_IC = 0.20  # 提高目标 IC (0.055 -> 0.20)
+    SOTA_MIN_IC = 0.05  # 提高最低 IC 阈值 (0.02 -> 0.05)
+    SOTA_TARGET_ICIR = 1.0  # 提高目标 ICIR (0.55 -> 1.0)
+    SOTA_MIN_IC_SAVE = 0.10  # 提高保存模型的IC阈值 (0.04 -> 0.10)
+    BAD_EPOCH_LIMIT = 15  # 增加bad epoch限制 (10 -> 15)
     
     # ============ Risk Control ============
     INDEX_CODE = '000905.SH'  # 中证500作为大盘风向标
@@ -115,6 +122,12 @@ class Config:
     API_RATE_LIMIT = 0.05  # API调用间隔（秒）（A100可处理更快的数据下载）
     MAX_RETRY_TIMES = 10  # 最大重试次数（确保数据完整性）
     RETRY_DELAY = 3.0  # 重试延迟（秒）（平衡速度和稳定性）
+    
+    # ============ Memory Optimization (for 96GB RAM) ============
+    MEMORY_LIMIT = 0.8  # 使用80%的可用内存
+    PARALLEL_WORKERS = min(os.cpu_count(), 32)  # 并行处理核心数
+    BATCH_PROCESS_SIZE = 500  # 批处理大小
+    DATA_CHUNK_SIZE = 1000000  # 数据分块大小
     
     # ============ Portfolio ============
     PORTFOLIO_DIR = DATA_ROOT / "portfolio"

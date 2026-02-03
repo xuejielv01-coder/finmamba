@@ -66,8 +66,9 @@ class Preprocessor:
         'ma5_ratio', 'ma20_ratio', 'ma60_ratio', # 移除了ma10
         'atr_ratio', 'cci', 'willr',
         'obv_ratio', 'mtm', 'roc', 'kdj_k', 'kdj_d',
-        # 高级Alpha因子 (6)
+        # 高级Alpha因子 (9)
         'alpha_001', 'alpha_006', 'alpha_plus_di', 'alpha_minus_di', 'alpha_adx', 'alpha_wr',
+        'vol_price_divergence', 'high_low_range_ratio', 'return_skewness_5d',
         # 估值指标 (4)
         'pe_zscore', 'pb_zscore', 'ps_zscore', 'total_mv_rank',
         # 时间特征 (4)
@@ -373,6 +374,16 @@ class Preprocessor:
         hh = high.rolling(period).max()
         ll = low.rolling(period).min()
         df['alpha_wr'] = -100 * (hh - close) / (hh - ll + 1e-8)
+        
+        # New Factors
+        # 1. Volume-Price Divergence (Correlation between return and volume change)
+        df['vol_price_divergence'] = df['close_pct'].rolling(10).corr(df['vol'].pct_change())
+        
+        # 2. High-Low Range Ratio
+        df['high_low_range_ratio'] = (high - low) / (close.rolling(20).mean() + 1e-8)
+        
+        # 3. Return Skewness
+        df['return_skewness_5d'] = df['close_pct'].rolling(5).skew()
         
         return df
     
@@ -916,6 +927,9 @@ class Preprocessor:
         Returns:
             处理后的合并 DataFrame
         """
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        
         raw_dir = Config.RAW_DATA_DIR
         all_dfs = []
         
@@ -924,57 +938,88 @@ class Preprocessor:
         
         logger.info(f"Processing {total} files...")
         
-        for i, parquet_file in enumerate(parquet_files):
-            if 'index_' in parquet_file.name:
-                continue
-            
-            try:
-                df = pd.read_parquet(parquet_file)
-                
-                # Check for trade_date column variations
-                if 'trade_date' not in df.columns:
-                    # Try to find date column
-                    for col in ['Date', 'date', 'time', 'timestamp']:
-                        if col in df.columns:
-                            df = df.rename(columns={col: 'trade_date'})
-                            break
-                
-                if 'trade_date' not in df.columns:
-                    logger.error(f"Missing 'trade_date' column in {parquet_file}. Columns: {list(df.columns)}")
-                    continue
-
-                # 主板过滤
-                if 'ts_code' in df.columns:
-                    ts_code = df['ts_code'].iloc[0]
-                    if not is_main_board(ts_code):
-                        continue
-                
-                # 处理特征
-                df = self.process_daily_data(df)
-                if not df.empty:
-                    all_dfs.append(df)
-                
-                if (i + 1) % 100 == 0:
-                    logger.info(f"Processed {i + 1}/{total} files")
+        # 并行处理文件
+        max_workers = min(multiprocessing.cpu_count(), 16)  # 使用最多16个核心
+        logger.info(f"Using {max_workers} parallel workers for processing")
+        
+        # 过滤掉指数文件
+        stock_files = [f for f in parquet_files if 'index_' not in f.name]
+        
+        # 批量处理文件
+        batch_size = 100  # 每批处理100个文件
+        processed_count = 0
+        
+        def process_file_batch(file_batch):
+            """处理一批文件"""
+            batch_results = []
+            for parquet_file in file_batch:
+                try:
+                    df = pd.read_parquet(parquet_file)
                     
-            except Exception as e:
-                logger.error(f"Error processing {parquet_file}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                continue
+                    # Check for trade_date column variations
+                    if 'trade_date' not in df.columns:
+                        # Try to find date column
+                        for col in ['Date', 'date', 'time', 'timestamp']:
+                            if col in df.columns:
+                                df = df.rename(columns={col: 'trade_date'})
+                                break
+                    
+                    if 'trade_date' not in df.columns:
+                        logger.error(f"Missing 'trade_date' column in {parquet_file}. Columns: {list(df.columns)}")
+                        continue
+
+                    # 主板过滤
+                    if 'ts_code' in df.columns:
+                        ts_code = df['ts_code'].iloc[0]
+                        if not is_main_board(ts_code):
+                            continue
+                    
+                    # 处理特征
+                    df = self.process_daily_data(df)
+                    if not df.empty:
+                        batch_results.append(df)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {parquet_file}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    continue
+            return batch_results
+        
+        # 分批次处理
+        for i in range(0, len(stock_files), batch_size):
+            batch_files = stock_files[i:i+batch_size]
+            
+            # 并行处理当前批次
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # 将批次分成更小的子批次，每个worker处理一个子批次
+                sub_batch_size = max(1, len(batch_files) // max_workers)
+                sub_batches = [batch_files[j:j+sub_batch_size] for j in range(0, len(batch_files), sub_batch_size)]
+                
+                futures = [executor.submit(process_file_batch, sub_batch) for sub_batch in sub_batches]
+                
+                for future in as_completed(futures):
+                    batch_results = future.result()
+                    all_dfs.extend(batch_results)
+            
+            processed_count += len(batch_files)
+            logger.info(f"Processed {processed_count}/{len(stock_files)} files")
         
         if not all_dfs:
             logger.warning("No data processed")
             return pd.DataFrame()
         
         # 合并
+        logger.info(f"Merging {len(all_dfs)} processed dataframes...")
         merged_df = pd.concat(all_dfs, ignore_index=True)
+        
         # 确保日期格式统一后再排序
         if 'trade_date' in merged_df.columns:
             merged_df['trade_date'] = pd.to_datetime(merged_df['trade_date'], errors='coerce')
             merged_df = merged_df.dropna(subset=['trade_date'])
         
         merged_df = merged_df.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
+        logger.info(f"Merged data shape: {merged_df.shape}")
         
         # Calculate Market State Features (using aggregated data)
         logger.info("Calculating market state features...")
@@ -994,7 +1039,11 @@ class Preprocessor:
         
         normalized_dfs = []
         # Group by trade_date (datetime)
-        for date, group in merged_df.groupby('trade_date'):
+        
+        # 并行计算每个日期的统计量
+        def process_date_group(date_group):
+            """处理单个日期组"""
+            date, group = date_group
             date_str = date.strftime('%Y%m%d')
             
             # Calculate and cache statistics
@@ -1002,8 +1051,20 @@ class Preprocessor:
             
             # Apply Normalization
             norm_group = self.apply_zscore(group, stats)
-            normalized_dfs.append(norm_group)
+            return norm_group
+        
+        # 获取所有日期组
+        date_groups = list(merged_df.groupby('trade_date'))
+        logger.info(f"Processing {len(date_groups)} date groups...")
+        
+        # 并行处理日期组
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_date_group, group) for group in date_groups]
             
+            for future in as_completed(futures):
+                norm_group = future.result()
+                normalized_dfs.append(norm_group)
+        
         if normalized_dfs:
             final_df = pd.concat(normalized_dfs, ignore_index=True)
             final_df = final_df.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
@@ -1022,7 +1083,14 @@ class Preprocessor:
                     # ensure string format consistency just in case
                     pass
 
-            final_df_save.to_parquet(save_path, index=False)
+            # 使用更快的存储格式
+            logger.info(f"Saving processed data to {save_path}...")
+            final_df_save.to_parquet(
+                save_path, 
+                index=False,
+                compression='snappy',
+                engine='pyarrow'
+            )
             logger.info(f"Processed (and normalized) data saved to {save_path}")
         
         return final_df

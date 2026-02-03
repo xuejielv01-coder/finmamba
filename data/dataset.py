@@ -255,15 +255,15 @@ class FastAlphaDataset(Dataset):
         logger.info(f"  Date range: {date_range[0].strftime('%Y-%m-%d')} to {date_range[-1].strftime('%Y-%m-%d')}")
         logger.info(f"  Total trading days: {len(date_range)}")
         
-        # 分块读取数据 - 充分利用32GB内存，增大分块大小提高处理速度
-        chunk_size = 10000  # 每次读取 10000 只股票，充分利用32GB内存
+        # 分块读取数据 - 充分利用 96GB 内存，显著增大分块大小
+        chunk_size = 50000  # 大幅增加分块大小 (10000 -> 50000)
         features_list = []
         labels_list = []
-        industry_list = []  # 行业代码列表
+        industry_list = []
         samples = []
         
-        # 内存优化：减少清理频率，降低清理开销，充分利用32GB内存
-        MEMORY_CLEAR_INTERVAL = 20  # 每处理20个块清理一次内存
+        # 内存优化：针对 96GB 内存减少清理频率
+        MEMORY_CLEAR_INTERVAL = 50  # 增加清理间隔 (20 -> 50)
         
         # 行业代码映射 (股票代码 -> 行业ID)
         industry_map = self.get_stock_industry_map()
@@ -819,66 +819,62 @@ class AlphaDataModule:
         pass
     
     def train_dataloader(self) -> DataLoader:
-        """训练数据加载器 - 超优化版"""
+        """训练数据加载器 - 超优化版 (适配 A800 & 96GB RAM)"""
         import os
         import multiprocessing
         
-        # 优化 num_workers：根据 CPU 核心数动态调整
-        # 13代 i5 通常是 6 核 12 线程
+        # 优化 num_workers：在 96GB 内存下，Windows 也可以尝试开启少量 workers
         if self.num_workers is None:
+            cpu_count = multiprocessing.cpu_count() or 6
             if os.name == 'nt':  # Windows
-                # Windows 下使用 0 workers（避免内存复制问题）
-                # Windows 下每个 worker 进程都会复制数据集到内存中
-                self.num_workers = 0
+                # Windows 下开启 4 个 worker，配合 persistent_workers
+                self.num_workers = min(4, cpu_count)
             else:  # Linux/Mac
-                # Linux 下可以使用更多 workers
-                cpu_count = multiprocessing.cpu_count() or 6
                 self.num_workers = min(8, cpu_count)
         
-        logger.info(f"Train dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}")
+        # 硬件加速配置
+        pin_memory = getattr(Config, 'PIN_MEMORY', True)
         
-        # Windows 下禁用 persistent_workers（避免 pickle 问题）
-        persistent_workers = False if os.name == 'nt' else True
+        logger.info(f"Train dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}, pin_memory={pin_memory}")
+        
+        # A800 优化：启用 persistent_workers 和 prefetch_factor
+        # 注意：Windows 下使用 num_workers > 0 必须在 main 中运行
+        persistent_workers = True if self.num_workers > 0 else False
         
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
             drop_last=True,
-            persistent_workers=persistent_workers,  # Windows 下禁用
-            prefetch_factor=2 if persistent_workers else None,  # Windows 下禁用
-            # Windows 下需要设置 spawn_start_method
+            persistent_workers=persistent_workers,
+            prefetch_factor=2 if persistent_workers else None,
         )
     
     def val_dataloader(self) -> DataLoader:
-        """验证数据加载器"""
+        """验证数据加载器 - 优化版"""
         import os
         import multiprocessing
         
-        # 验证集使用较少的 workers
         if self.num_workers is None:
-            if os.name == 'nt':  # Windows
-                # Windows 下使用 0 workers（避免内存复制问题）
-                self.num_workers = 0
-            else:  # Linux/Mac
-                cpu_count = multiprocessing.cpu_count() or 6
-                self.num_workers = min(6, cpu_count)
+            cpu_count = multiprocessing.cpu_count() or 6
+            if os.name == 'nt':
+                self.num_workers = min(2, cpu_count)
+            else:
+                self.num_workers = min(4, cpu_count)
         
-        logger.info(f"Val dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}")
-        
-        # Windows 下禁用 persistent_workers（避免 pickle 问题）
-        persistent_workers = False if os.name == 'nt' else True
+        pin_memory = getattr(Config, 'PIN_MEMORY', True)
+        persistent_workers = True if self.num_workers > 0 else False
         
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,  # Windows 下禁用
-            prefetch_factor=2 if persistent_workers else None,  # Windows 下禁用
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=2 if persistent_workers else None,
         )
     
     def test_dataloader(self) -> DataLoader:

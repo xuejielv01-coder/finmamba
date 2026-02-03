@@ -141,47 +141,54 @@ class StrategyFilter:
             latest = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # === '金鹤' 策略逻辑 ===
+            # === '金鹤' 策略 2.0 逻辑 ===
             reasons = []
             signal_strength = 0
             
-            # 1. 模型分数据 (Core)
-            if score < 0.55: # 放宽一点初筛
+            # 1. 模型分数据 (Core) - 考虑 1d, 3d, 5d 的综合得分
+            # 假设 score 是 1d 预测，我们可以扩展 _batch_predict 返回多期限
+            if score < 0.2: # 降低初筛门槛，依靠多维度过滤
                 continue
-            signal_strength += (score - 0.5) * 10 
+            signal_strength += score * 5
             
             # 2. 趋势共振 (Trend)
             close = latest['close']
+            ma5 = df['close'].rolling(5).mean().iloc[-1]
             ma20 = df['close'].rolling(20).mean().iloc[-1]
             ma60 = df['close'].rolling(60).mean().iloc[-1]
             
-            if close > ma20 and ma20 > ma60:
-                reasons.append("多头排列")
-                signal_strength += 2
+            if close > ma5 > ma20 > ma60:
+                reasons.append("均线多头")
+                signal_strength += 3
             elif close > ma20:
                 reasons.append("站上月线")
                 signal_strength += 1
-            else:
-                # 趋势不好，除非分数极高否则过滤
-                if score < 0.7:
-                    continue
             
-            # 3. 量能确认 (Volume)
+            # 3. 量价配合 (Volume-Price)
             vol = latest['vol']
             vol_ma5 = df['vol'].rolling(5).mean().iloc[-1]
-            if vol > vol_ma5:
-                reasons.append("量能温和放大")
+            if vol > vol_ma5 * 1.5 and latest['close_pct'] > 2:
+                reasons.append("放量大涨")
+                signal_strength += 2
+            elif vol < vol_ma5 * 0.7 and abs(latest['close_pct']) < 1:
+                reasons.append("缩量整理")
                 signal_strength += 1
             
-            # 4. 筹码稳定 (Volatility)
-            # 剔除最近暴涨暴跌的
-            atr = (df['high'] - df['low']).mean()
-            if (latest['high'] - latest['low']) > 3 * atr:
-                # 剧烈波动，风险大
-                if score < 0.8: continue
+            # 4. 筹码与稳定性 (Volatility)
+            atr = (df['high'] - df['low']).rolling(20).mean().iloc[-1]
+            if (latest['high'] - latest['low']) > 4 * atr:
+                # 异常巨震，除非分数极高
+                if score < 0.6: continue
             
-            # 5. 资金流 (Money Flow) - 既然已预处理，假设模型已学到
-            # 这里可以用显式规则加强
+            # 5. 行业领先度 (Industry)
+            # 如果模型分高且行业表现也好
+            if 'sector_avg_ret' in latest and latest['sector_avg_ret'] > 0:
+                reasons.append("行业走强")
+                signal_strength += 1
+            
+            # 6. 最终过滤
+            if signal_strength < 4:
+                continue
             
             row = row.to_dict()
             row['strategy'] = 'GoldenCrane'
