@@ -16,111 +16,80 @@ class Config:
     """全局配置单例类"""
     
     # ============ System ============
-    SEED = 42
-    LOG_FILE = "logs/deepalpha.log"
-    PROJECT_ROOT = Path(__file__).parent.parent
+    SEED: int = 42
+    LOG_FILE: str = "logs/deepalpha.log"
+    PROJECT_ROOT: Path = Path(__file__).parent.parent
     
     # ============ Data ============
     # 从环境变量读取或使用默认值
-    TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "30d634a271dcc867e5a14046e9b570af049a0326df7dd1cf64d28021")
-    DATA_ROOT = PROJECT_ROOT / "data"
-    RAW_DATA_DIR = DATA_ROOT / "raw"
-    PROCESSED_DATA_DIR = DATA_ROOT / "processed"
-    STATS_CACHE = DATA_ROOT / "stats"
-    MANIFEST_FILE = DATA_ROOT / "manifest.json"
+    TUSHARE_TOKEN: str = os.getenv("TUSHARE_TOKEN", "30d634a271dcc867e5a14046e9b570af049a0326df7dd1cf64d28021")
+    DATA_ROOT: Path = PROJECT_ROOT / "data"
+    RAW_DATA_DIR: Path = DATA_ROOT / "raw"
+    PROCESSED_DATA_DIR: Path = DATA_ROOT / "processed"
+    STATS_CACHE: Path = DATA_ROOT / "stats"
+    MANIFEST_FILE: Path = DATA_ROOT / "manifest.json"
     
     # ============ Unified Cache Paths ============
-    CACHE_DIR = DATA_ROOT / "cache"
-    SCORE_CACHE_DIR = CACHE_DIR / "scores"
-    KLINE_CACHE_DIR = CACHE_DIR / "kline"
-    INDICATOR_CACHE_DIR = CACHE_DIR / "indicators"
-    MODEL_CACHE_DIR = CACHE_DIR / "models"
-    QUALITY_REPORT_DIR = DATA_ROOT / "quality_reports"
+    CACHE_DIR: Path = DATA_ROOT / "cache"
+    SCORE_CACHE_DIR: Path = CACHE_DIR / "scores"
+    KLINE_CACHE_DIR: Path = CACHE_DIR / "kline"
+    INDICATOR_CACHE_DIR: Path = CACHE_DIR / "indicators"
+    MODEL_CACHE_DIR: Path = CACHE_DIR / "models"
+    QUALITY_REPORT_DIR: Path = DATA_ROOT / "quality_reports"
     
     # Cache expiry settings (hours)
-    CACHE_EXPIRY_STOCK_DATA = 24    # 股票数据24小时过期
-    CACHE_EXPIRY_KLINE = 12          # K线数据12小时过期
-    CACHE_EXPIRY_STATS = 48          # 统计量48小时过期
-    CACHE_EXPIRY_STOCK_LIST = 168    # 股票列表一周过期
+    CACHE_EXPIRY_STOCK_DATA: int = 24    # 股票数据24小时过期
+    CACHE_EXPIRY_KLINE: int = 12          # K线数据12小时过期
+    CACHE_EXPIRY_STATS: int = 48          # 统计量48小时过期
+    CACHE_EXPIRY_STOCK_LIST: int = 168    # 股票列表一周过期
 
     
     # ============ Constraints ============    
-    ONLY_MAIN_BOARD = True  # 仅主板股票 (60, 00 开头)
-    DROP_ST = False  # 剔除 ST 股票
-    MAX_HOLDING_DAYS = 1  # 默认日频调仓
-    DOWNLOAD_YEARS = 3  # 下载历史数据年数 (前3年)
+    ONLY_MAIN_BOARD: bool = True  # 仅主板股票 (60, 00 开头)
+    DROP_ST: bool = False  # 剔除 ST 股票
+    MAX_HOLDING_DAYS: int = 1  # 默认日频调仓
+    DOWNLOAD_YEARS: int = 3  # 下载历史数据年数 (前3年)
     
     # ============ Data Split ============
     # 训练数据：前2年到前半年
     # 回测数据：前半年到现在
-    TRAIN_END_MONTHS = 6  # 训练数据结束时间：当前日期往前推6个月
-    TRAIN_START_YEARS = 2  # 训练数据开始时间：当前日期往前推2年（改为2年）
-    BACKTEST_START_MONTHS = 6  # 回测数据开始时间：当前日期往前推6个月
+    TRAIN_END_MONTHS: int = 6  # 训练数据结束时间：当前日期往前推6个月
+    TRAIN_START_YEARS: int = 2  # 训练数据开始时间：当前日期往前推2年（改为2年）
+    BACKTEST_START_MONTHS: int = 6  # 回测数据开始时间：当前日期往前推6个月
     
-    # ============ FinMamba Architecture (Optimized for A800 80GB) ============
-    SEQ_LEN = 60  
-    FEATURE_DIM = 85  
-    D_MODEL = 512  
-    N_LAYERS = 6  
-    N_TRANSFORMER_LAYERS = 4  
-    N_HEADS = 16  
-    D_STATE = 256  
-    D_CONV = 4  
-    EXPAND = 2  
-    MAMBA_LEVELS = (1, 5, 20)  
-    N_INDUSTRIES = 111  
-    USE_GRAPH = True  
-    N_GCN_LAYERS = 3  
-    PATCH_LEN = 8  
-    STRIDE = 4  
+    # ============ FinMamba Architecture ============
+    SEQ_LEN: int = 60  # 回看天数
+    FEATURE_DIM: int = 82  # 扩展特征维度 (原始特征 + 新增技术指标 + 波动率特征 + 动量特征 + 市场状态特征)
+    D_MODEL: int = 128  # 模型隐藏维度（从96→128）
+    N_LAYERS: int = 4  # Mamba 层数（从3→4）
+    N_TRANSFORMER_LAYERS: int = 3  # Transformer 层数（从2→3）
+    N_HEADS: int = 8  # 多头注意力头数 (从6→8，确保128能被8整除)
+    D_STATE: int = 64  # SSM 状态维度（从32→64）
+    D_CONV: int = 4  # SSM 卷积核大小
+    EXPAND: int = 2  # SSM 扩展因子
+    MAMBA_LEVELS: tuple = (1, 5)  # 多尺度: 日级和周级
+    N_INDUSTRIES: int = 111  # 实际约111个行业，预留空间 (申万一级行业)
+    USE_GRAPH: bool = True  # 使用行业嵌入
+    N_GCN_LAYERS: int = 2  # GCN层数
+    PATCH_LEN: int = 12  # 保留兼容性
+    STRIDE: int = 8  # 保留兼容性
 
-    # ============ Training (Optimized for A800 80GB & 96GB RAM) ============
-    TRAIN_YEARS = 5  # 增加训练数据量 (3 -> 5)
-    
-    def _get_adaptive_batch_size():
-        """根据显存大小自适应设置 Batch Size"""
-        default_bs = 512
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                return 64
-            
-            # 获取 GPU 0 的显存大小 (GB)
-            # 注意：torch.cuda.get_device_properties 可能会初始化 CUDA 上下文
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            
-            # A800 80G -> 1024 (原 2048 在编译时容易 OOM)
-            if vram_gb > 70:
-                return 1024
-            # A100 40G / V100 32G -> 512
-            elif vram_gb > 30:
-                return 512
-            # 3090/4090 24G -> 256
-            elif vram_gb > 20:
-                return 256
-            # T4 16G / Others -> 128
-            else:
-                return 128
-        except Exception:
-            return default_bs
+    # ============ Training (Optimized for Strong Generalization) ============
+    TRAIN_YEARS: int = 2  # 使用2年数据训练（与 TRAIN_START_YEARS 保持一致，从3→2）
+    BATCH_SIZE: int = 32  # 进一步减小batch size至32，适应6GB GPU显存
+    GRAD_ACCUM_STEPS: int = 4  # 梯度累积步长，模拟更大的批次大小 (384 * 4 = 1536)
+    LR_INIT: float = 5e-4  # 学习率（从1e-3→5e-4，更深的模型需要更小的学习率）
+    WEIGHT_DECAY: float = 3e-3  # 权重衰减（从5e-3→3e-3，平衡正则化和模型表达能力）
+    MAX_EPOCHS: int = 100  # 最大epoch数（从50→100，增加训练轮数）
+    PATIENCE: int = 15  # 早停耐心值（从8→15，给予模型更多训练时间）
+    DROPOUT: float = 0.25  # 增加dropout比例（从0.2→0.25，防止过拟合）
+    SLIDE_STEP: int = 3  # 滑动窗口步长，可根据需要调整，默认为5，平衡速度和性能
 
-    BATCH_SIZE = _get_adaptive_batch_size()  # 自适应 Batch Size
-    GRAD_ACCUM_STEPS = 1  # A800 80GB 不需要梯度累积
-    LR_INIT = 1e-4  # 增加学习率以适应大 batch (5e-5 -> 1e-4)
-    WEIGHT_DECAY = 1e-2  
-    MAX_EPOCHS = 150  
-    PATIENCE = 30  
-    DROPOUT = 0.3  
-    SLIDE_STEP = 1  # 减小滑动窗口步长以产生更多样本 (2 -> 1)
-    
-    # 硬件加速开关
-    USE_AMP = True
-    USE_BF16 = True  # A800 完美支持 BF16
-    ENABLE_COMPILE = True  # 启用 torch.compile
-    PIN_MEMORY = True
-    NUM_WORKERS = 8
-    DATALOADER_TIMEOUT_SEC = 180
-    USE_DATA_AUGMENTATION = False
+    # ============ Downloader ============
+    CONCURRENT_WORKERS = 16  # 并发下载线程数（增加以提高速度）
+    API_RATE_LIMIT = 0.3  # API调用间隔（秒）（适当减少以提高速度）
+    MAX_RETRY_TIMES = 3  # 最大重试次数（减少以避免长时间等待）
+    RETRY_DELAY = 3.0  # 重试延迟（秒）（减少以提高速度）
     COMPILE_WARMUP = True
     LOG_FIRST_BATCH_TIMING = True
 
@@ -183,7 +152,7 @@ class Config:
     
     
     @classmethod
-    def ensure_dirs(cls):
+    def ensure_dirs(cls) -> None:
         """确保所有必要目录存在"""
         dirs = [
             cls.DATA_ROOT,
@@ -206,7 +175,7 @@ class Config:
             d.mkdir(parents=True, exist_ok=True)
     
     @classmethod
-    def validate(cls):
+    def validate(cls) -> bool:
         """验证配置有效性"""
         assert cls.SEED >= 0, "SEED must be non-negative"
         assert cls.SEQ_LEN > 0, "SEQ_LEN must be positive"
@@ -215,7 +184,7 @@ class Config:
         return True
     
     @classmethod
-    def update_model_params(cls, **kwargs):
+    def update_model_params(cls, **kwargs) -> None:
         """
         动态更新模型参数
         
@@ -240,7 +209,7 @@ class Config:
             cls.DROPOUT = kwargs['dropout']
     
     @classmethod
-    def update_training_params(cls, **kwargs):
+    def update_training_params(cls, **kwargs) -> None:
         """
         动态更新训练参数
         

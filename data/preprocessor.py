@@ -12,7 +12,7 @@ PRD 2.2 实现
 
 import json
 from pathlib import Path
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Any
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -88,7 +88,7 @@ class Preprocessor:
         'extra_feat_1', 'extra_feat_2', 'extra_feat_3', 
     ]
     
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化预处理器"""
         Config.ensure_dirs()
         self.stats_cache_dir = Config.STATS_CACHE
@@ -103,34 +103,9 @@ class Preprocessor:
         
         df = df.copy()
         
-        # 确保日期排序
-        try:
-            # 尝试转换 trade_date 列
-            if 'trade_date' not in df.columns:
-                logger.error("No 'trade_date' column found in DataFrame")
-                return df
-            
-            # 转换日期格式
-            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
-            
-            # 处理转换失败的日期
-            null_count = df['trade_date'].isnull().sum()
-            if null_count > 0:
-                logger.warning(f"Found {null_count} null trade_date values, removing those rows")
-                df = df.dropna(subset=['trade_date'])
-            
-            # 确保日期排序
-            if not df.empty:
-                df = df.sort_values('trade_date').reset_index(drop=True)
-                logger.debug(f"Data sorted by trade_date: {df['trade_date'].min()} to {df['trade_date'].max()}")
-        except Exception as e:
-            logger.error(f"Error processing trade_date: {e}")
-            # 尝试恢复，使用默认日期
-            from datetime import datetime, timedelta
-            if not df.empty:
-                dates = [datetime.now() - timedelta(days=i) for i in range(len(df))]
-                df['trade_date'] = dates
-                df = df.sort_values('trade_date').reset_index(drop=True)
+        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+        df = df.dropna(subset=['trade_date'])
+        df = df.sort_values('trade_date').reset_index(drop=True)
         
         # 1. 计算价格基础特征
         df = self._calculate_price_features(df)
@@ -396,7 +371,7 @@ class Preprocessor:
         rsi = 100 - (100 / (1 + rs))
         return rsi
     
-    def _calculate_macd(self, close: pd.Series) -> Dict:
+    def _calculate_macd(self, close: pd.Series) -> Dict[str, pd.Series]:
         """计算 MACD"""
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -405,7 +380,7 @@ class Preprocessor:
         hist = macd - signal
         return {'macd': macd, 'signal': signal, 'hist': hist}
     
-    def _calculate_bollinger(self, close: pd.Series, period: int = 20) -> Dict:
+    def _calculate_bollinger(self, close: pd.Series, period: int = 20) -> Dict[str, pd.Series]:
         """计算 Bollinger Bands"""
         ma = close.rolling(period).mean()
         std = close.rolling(period).std()
@@ -438,7 +413,7 @@ class Preprocessor:
         willr = -100 * (hh - close) / (hh - ll + 1e-8)
         return willr
     
-    def _calculate_kdj(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 9) -> Dict:
+    def _calculate_kdj(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 9) -> Dict[str, pd.Series]:
         """计算 KDJ 指标"""
         hh = high.rolling(period).max()
         ll = low.rolling(period).min()
@@ -458,45 +433,18 @@ class Preprocessor:
         df['pe_zscore'] = df.get('pe', 0)
         df['pb_zscore'] = df.get('pb', 0)
         df['ps_zscore'] = df.get('ps', 0)
-        
-        # 换手率和量比
-        df['turnover_rate'] = df.get('turnover_rate', 0)
-        df['volume_ratio'] = df.get('volume_ratio', 1)
-        
-        # 市值排名 (百分位)
         df['total_mv_rank'] = df.get('total_mv', 0)
-        
         return df
-    
+
     def _calculate_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算时间特征"""
         try:
-            # 确保 trade_date 是 datetime 类型
-            if 'trade_date' not in df.columns:
-                logger.error("No 'trade_date' column found for time features calculation")
-                # 填充默认值
-                df['weekday'] = 0.0
-                df['month'] = 0.0
-                df['is_month_start'] = 0.0
-                df['is_month_end'] = 0.0
-                return df
-            
-            # 转换为 datetime 类型
-            if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
-                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
-                
-                # 处理转换失败的日期
-                null_count = df['trade_date'].isnull().sum()
-                if null_count > 0:
-                    logger.warning(f"Found {null_count} null trade_date values in time features calculation")
-            
-            # 计算时间特征
+            df['trade_date'] = pd.to_datetime(df['trade_date'])
             df['weekday'] = df['trade_date'].dt.dayofweek / 4.0  # 归一化到 [0, 1]
             df['month'] = (df['trade_date'].dt.month - 1) / 11.0  # 归一化到 [0, 1]
             df['is_month_start'] = df['trade_date'].dt.is_month_start.astype(float)
             df['is_month_end'] = df['trade_date'].dt.is_month_end.astype(float)
             
-            # 处理可能的 NaN 值
             time_features = ['weekday', 'month', 'is_month_start', 'is_month_end']
             for feature in time_features:
                 df[feature] = df[feature].fillna(0.0)
@@ -530,31 +478,11 @@ class Preprocessor:
         
         # 动量特征
         df['momentum_5d'] = close.pct_change(5) * 100
-        df['momentum_20d'] = close.pct_change(20) * 100
-        df['momentum_60d'] = close.pct_change(60) * 100
         
         return df
-    
-    def _calculate_market_state_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        计算市场状态特征
-        
-        由于没有实际的大盘指数数据，这里使用全市场股票的平均值来模拟市场状态特征
-        """
-        # 检查必要的列
-        if 'trade_date' not in df.columns or 'close' not in df.columns or 'vol' not in df.columns:
-            logger.warning("Missing required columns for market state features calculation")
-            # 填充默认值
-            market_state_cols = [
-                'market_index_ret', 'market_index_ma5_ratio', 'market_index_ma20_ratio',
-                'market_index_vol_ratio', 'market_index_rsi', 'market_index_macd',
-                'industry_rotation_strength', 'market_breadth', 'market_updown_ratio',
-                'market_volatility'
-            ]
-            for col in market_state_cols:
-                df[col] = 0.0
-            return df
-        
+
+    def _calculate_market_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算市场状态特征"""
         try:
             # 模拟大盘指数：使用所有股票的平均收盘价
             market_close = df.groupby('trade_date')['close'].mean()
@@ -649,7 +577,7 @@ class Preprocessor:
         self, 
         all_stocks_df: pd.DataFrame, 
         date: str
-    ) -> Dict:
+    ) -> Dict[str, Any]:
         """
         计算截面统计量并缓存
         
@@ -681,7 +609,7 @@ class Preprocessor:
         logger.debug(f"Stats cached for {date}")
         return stats
     
-    def load_stats_cache(self, date: str) -> Optional[Dict]:
+    def load_stats_cache(self, date: str) -> Optional[Dict[str, Any]]:
         """
         加载统计量缓存
         
@@ -697,7 +625,7 @@ class Preprocessor:
                 return json.load(f)
         return None
     
-    def get_latest_stats_cache(self) -> Optional[Dict]:
+    def get_latest_stats_cache(self) -> Optional[Dict[str, Any]]:
         """
         获取最近一个可用日期的统计缓存
         
@@ -725,7 +653,7 @@ class Preprocessor:
         
         return None
     
-    def generate_stats_cache(self, date: str, use_prev_date=True) -> Optional[Dict]:
+    def generate_stats_cache(self, date: str, use_prev_date: bool = True) -> Optional[Dict[str, Any]]:
         """
         生成指定日期的统计缓存
         
@@ -888,7 +816,7 @@ class Preprocessor:
     def apply_zscore(
         self, 
         df: pd.DataFrame, 
-        stats: Dict = None
+        stats: Optional[Dict[str, Any]] = None
     ) -> pd.DataFrame:
         """
         应用 Z-Score 标准化
@@ -916,9 +844,6 @@ class Preprocessor:
                     median = stats['median'][i]
                     mad = stats['mad'][i]
                     mad = max(mad, 1e-8)  # 避免除零
-                    df[feat] = (df[feat] - median) / (1.4826 * mad)
-        
-        return df
     
     def process_all_data(self, save_processed: bool = True) -> pd.DataFrame:
         """
@@ -927,143 +852,78 @@ class Preprocessor:
         Returns:
             处理后的合并 DataFrame
         """
-        import multiprocessing
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        
-        raw_dir = Config.RAW_DATA_DIR
+        save_path = Config.PROCESSED_DATA_DIR / "all_features.parquet"
+        parquet_files = list(Config.RAW_DATA_DIR.glob("*.parquet"))
+        total = len(parquet_files)
         all_dfs = []
         
-        parquet_files = list(raw_dir.glob("*.parquet"))
-        total = len(parquet_files)
-        
-        logger.info(f"Processing {total} files...")
-        
-        # 并行处理文件
-        max_workers = min(multiprocessing.cpu_count(), 16)  # 使用最多16个核心
-        logger.info(f"Using {max_workers} parallel workers for processing")
-        
-        # 过滤掉指数文件
-        stock_files = [f for f in parquet_files if 'index_' not in f.name]
-        
-        # 批量处理文件
-        batch_size = 100  # 每批处理100个文件
-        processed_count = 0
-        
-        def process_file_batch(file_batch):
-            """处理一批文件"""
-            batch_results = []
-            for parquet_file in file_batch:
-                try:
-                    df = pd.read_parquet(parquet_file)
-                    
-                    # Check for trade_date column variations
-                    if 'trade_date' not in df.columns:
-                        # Try to find date column
-                        for col in ['Date', 'date', 'time', 'timestamp']:
-                            if col in df.columns:
-                                df = df.rename(columns={col: 'trade_date'})
-                                break
-                    
-                    if 'trade_date' not in df.columns:
-                        logger.error(f"Missing 'trade_date' column in {parquet_file}. Columns: {list(df.columns)}")
-                        continue
-
-                    # 主板过滤
-                    if 'ts_code' in df.columns:
-                        ts_code = df['ts_code'].iloc[0]
-                        if not is_main_board(ts_code):
-                            continue
-                    
-                    # 处理特征
-                    df = self.process_daily_data(df)
-                    if not df.empty:
-                        batch_results.append(df)
-                        
-                except Exception as e:
-                    logger.error(f"Error processing {parquet_file}: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+        for i, parquet_file in enumerate(parquet_files):
+            if 'index_' in parquet_file.name:
+                continue
+            
+            try:
+                df = pd.read_parquet(parquet_file)
+                
+                # Check for trade_date column variations
+                if 'trade_date' not in df.columns:
+                    # Try to find date column
+                    for col in ['Date', 'date', 'time', 'timestamp']:
+                        if col in df.columns:
+                            df = df.rename(columns={col: 'trade_date'})
+                            break
+                
+                if 'trade_date' not in df.columns:
+                    logger.error(f"Missing 'trade_date' column in {parquet_file}. Columns: {list(df.columns)}")
                     continue
-            return batch_results
-        
-        # 分批次处理
-        for i in range(0, len(stock_files), batch_size):
-            batch_files = stock_files[i:i+batch_size]
-            
-            # 并行处理当前批次
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # 将批次分成更小的子批次，每个worker处理一个子批次
-                sub_batch_size = max(1, len(batch_files) // max_workers)
-                sub_batches = [batch_files[j:j+sub_batch_size] for j in range(0, len(batch_files), sub_batch_size)]
+                    # Check for trade_date column variations
+                # 主板过滤
+                if 'ts_code' in df.columns:
+                    ts_code = df['ts_code'].iloc[0]
+                    if not is_main_board(ts_code):
+                        continue
                 
-                futures = [executor.submit(process_file_batch, sub_batch) for sub_batch in sub_batches]
+                # 处理特征
+                df = self.process_daily_data(df)
+                if not df.empty:
+                    all_dfs.append(df)
                 
-                for future in as_completed(futures):
-                    batch_results = future.result()
-                    all_dfs.extend(batch_results)
-            
-            processed_count += len(batch_files)
-            logger.info(f"Processed {processed_count}/{len(stock_files)} files")
-        
+                if (i + 1) % 100 == 0:
+                    logger.info(f"Processed {i + 1}/{total} files")
+                    
+            except Exception as e:
+                logger.error(f"Error processing {parquet_file}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                continue
+                
         if not all_dfs:
             logger.warning("No data processed")
             return pd.DataFrame()
-        
+            
         # 合并
         logger.info(f"Merging {len(all_dfs)} processed dataframes...")
         merged_df = pd.concat(all_dfs, ignore_index=True)
-        
-        # 确保日期格式统一后再排序
-        if 'trade_date' in merged_df.columns:
-            merged_df['trade_date'] = pd.to_datetime(merged_df['trade_date'], errors='coerce')
-            merged_df = merged_df.dropna(subset=['trade_date'])
-        
-        merged_df = merged_df.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
-        logger.info(f"Merged data shape: {merged_df.shape}")
-        
-        # Calculate Market State Features (using aggregated data)
+        merged_df = self._calculate_market_features(merged_df)
         logger.info("Calculating market state features...")
         
         # 检查必要的列是否存在
         required_cols = ['trade_date', 'close', 'vol']
         missing_cols = [col for col in required_cols if col not in merged_df.columns]
-        
         if missing_cols:
-            logger.warning(f"Missing required columns for market state features: {missing_cols}")
-            logger.warning("Skipping market state features calculation")
-        else:
-            merged_df = self._calculate_market_state_features(merged_df)
-        
+             logger.warning(f"Missing columns: {missing_cols}")
+
         # 按日期计算截面统计量 并 进行标准化
         logger.info("Calculating cross-sectional statistics and normalizing data...")
         
         normalized_dfs = []
-        # Group by trade_date (datetime)
-        
-        # 并行计算每个日期的统计量
-        def process_date_group(date_group):
-            """处理单个日期组"""
-            date, group = date_group
-            date_str = date.strftime('%Y%m%d')
-            
-            # Calculate and cache statistics
-            stats = self.calculate_cross_sectional_stats(group, date_str)
-            
-            # Apply Normalization
-            norm_group = self.apply_zscore(group, stats)
-            return norm_group
-        
-        # 获取所有日期组
-        date_groups = list(merged_df.groupby('trade_date'))
-        logger.info(f"Processing {len(date_groups)} date groups...")
-        
-        # 并行处理日期组
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_date_group, group) for group in date_groups]
-            
-            for future in as_completed(futures):
-                norm_group = future.result()
+        for date, group in merged_df.groupby('trade_date'):
+            try:
+                # Apply Z-Score per date (cross-sectional normalization)
+                norm_group = self.apply_zscore(group)
                 normalized_dfs.append(norm_group)
+            except Exception as e:
+                logger.error(f"Error normalizing date {date}: {e}")
+                normalized_dfs.append(group)
         
         if normalized_dfs:
             final_df = pd.concat(normalized_dfs, ignore_index=True)
@@ -1072,26 +932,14 @@ class Preprocessor:
             final_df = merged_df # Fallback
         
         # 保存处理后的数据
-        if save_processed:
-            save_path = Config.PROCESSED_DATA_DIR / "all_features.parquet"
-            # Ensure trade_date is string YYYYMMDD for compatibility
-            final_df_save = final_df.copy()
-            if 'trade_date' in final_df_save.columns:
-                if pd.api.types.is_datetime64_any_dtype(final_df_save['trade_date']):
-                    final_df_save['trade_date'] = final_df_save['trade_date'].dt.strftime('%Y%m%d')
-                else:
-                    # ensure string format consistency just in case
-                    pass
-
-            # 使用更快的存储格式
-            logger.info(f"Saving processed data to {save_path}...")
-            final_df_save.to_parquet(
-                save_path, 
-                index=False,
-                compression='snappy',
-                engine='pyarrow'
-            )
-            logger.info(f"Processed (and normalized) data saved to {save_path}")
+        logger.info(f"Saving processed data to {save_path}...")
+        final_df.to_parquet(
+            save_path, 
+            index=False,
+            compression='snappy',
+            engine='pyarrow'
+        )
+        logger.info(f"Processed (and normalized) data saved to {save_path}")
         
         return final_df
 

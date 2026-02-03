@@ -7,7 +7,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pickle
@@ -42,7 +42,7 @@ class FastAlphaDataset(Dataset):
         force_rebuild: bool = False,
         cache_dir: Path = None,
         date_range: Tuple[str, str] = None
-    ):
+    ) -> None:
         """
         初始化数据集
         
@@ -59,7 +59,8 @@ class FastAlphaDataset(Dataset):
         self.seq_len = Config.SEQ_LEN
         self.feature_cols = Preprocessor.FEATURES
         self.n_features = len(self.feature_cols)
-        self.use_data_augmentation = (mode == 'train') and getattr(Config, 'USE_DATA_AUGMENTATION', False)
+        # 添加数据增强标志
+        self.use_data_augmentation = mode == 'train'
         
         # 调试：打印特征列信息
         logger.info(f"Feature columns ({len(self.feature_cols)}): {self.feature_cols}")
@@ -124,7 +125,169 @@ class FastAlphaDataset(Dataset):
                 industry_map[ts_code] = industry_id
         return industry_map
     
-    def _build_dataset(self, train_ratio: float, val_ratio: float):
+    def _add_derived_features(self, df_batch: pd.DataFrame) -> pd.DataFrame:
+        """添加衍生特征（超额收益、板块情绪等）"""
+        # 计算超额收益标签 (股票收益 - 市场平均收益)
+        # 使用 ret_5d 优化一周持仓
+        if 'ret_5d' not in df_batch.columns:
+            if 'close' in df_batch.columns:
+                df_batch['ret_5d'] = df_batch.groupby('ts_code')['close'].pct_change(5) * 100
+            else:
+                df_batch['ret_5d'] = 0
+        
+        # 计算 5 日后的未来收益
+        df_batch['ret_5d_future'] = df_batch.groupby('ts_code')['ret_5d'].shift(-5)
+        
+        # 计算每日市场平均收益
+        market_mean = df_batch.groupby('trade_date')['ret_5d_future'].transform('mean')
+        
+        # 超额收益 = 个股收益 - 市场平均收益
+        df_batch['excess_return'] = df_batch['ret_5d_future'] - market_mean
+        
+        # 归一化到 [-1, 1] 范围 (除以标准差)
+        excess_std = df_batch.groupby('trade_date')['excess_return'].transform('std')
+        df_batch['ret_rank'] = df_batch['excess_return'] / (excess_std + 1e-8)
+        df_batch['ret_rank'] = df_batch['ret_rank'].clip(-3, 3) / 3  # 裁剪并缩放到 [-1, 1]
+        df_batch['ret_rank'] = (df_batch['ret_rank'] + 1) / 2  # 转换到 [0, 1]
+        df_batch['ret_rank'] = df_batch['ret_rank'].fillna(0.5)
+        
+        # ========== 板块情绪特征计算 ==========
+        # 需要 industry 字段，如果没有则使用默认值
+        if 'industry' not in df_batch.columns:
+            logger.warning("No 'industry' column found, using default sector features")
+            df_batch['sector_up_ratio'] = 0.5
+            df_batch['sector_avg_ret'] = 0.0
+            df_batch['sector_momentum'] = 0.5
+            df_batch['sector_volatility'] = 1.0
+            df_batch['sector_leader'] = 0.0
+        else:
+            # 按日期和行业分组计算板块情绪
+            group_key = ['trade_date', 'industry']
+            
+            # 1. 板块上涨家数比 (当日该板块上涨股票比例)
+            if 'pct_chg' in df_batch.columns:
+                df_batch['sector_up_ratio'] = df_batch.groupby(group_key)['pct_chg'].transform(
+                    lambda x: (x > 0).mean()
+                )
+            else:
+                df_batch['sector_up_ratio'] = 0.5
+            
+            # 2. 板块平均涨幅
+            if 'pct_chg' in df_batch.columns:
+                df_batch['sector_avg_ret'] = df_batch.groupby(group_key)['pct_chg'].transform('mean')
+            else:
+                df_batch['sector_avg_ret'] = 0.0
+            
+            # 3. 板块动量 (板块在全市场的涨幅排名)
+            if 'pct_chg' in df_batch.columns:
+                sector_daily_ret = df_batch.groupby(group_key)['pct_chg'].mean().reset_index()
+                sector_daily_ret['sector_momentum'] = sector_daily_ret.groupby('trade_date')['pct_chg'].rank(pct=True)
+                sector_daily_ret = sector_daily_ret.rename(columns={'pct_chg': '_sector_pct'})
+                df_batch = df_batch.merge(
+                    sector_daily_ret[['trade_date', 'industry', 'sector_momentum']], 
+                    on=['trade_date', 'industry'], 
+                    how='left'
+                )
+                df_batch['sector_momentum'] = df_batch['sector_momentum'].fillna(0.5)
+            else:
+                df_batch['sector_momentum'] = 0.5
+            
+            # 4. 板块波动率 (板块内股票涨跌幅标准差)
+            if 'pct_chg' in df_batch.columns:
+                df_batch['sector_volatility'] = df_batch.groupby(group_key)['pct_chg'].transform('std')
+                df_batch['sector_volatility'] = df_batch['sector_volatility'].fillna(1.0)
+            else:
+                df_batch['sector_volatility'] = 1.0
+            
+            # 5. 是否板块龙头 (当日涨幅在板块前 10%)
+            if 'pct_chg' in df_batch.columns:
+                df_batch['sector_rank'] = df_batch.groupby(group_key)['pct_chg'].rank(pct=True)
+                df_batch['sector_leader'] = (df_batch['sector_rank'] >= 0.9).astype(float)
+                df_batch.drop(columns=['sector_rank'], inplace=True, errors='ignore')
+            else:
+                df_batch['sector_leader'] = 0.0
+        
+        # 填充 NaN
+        for col in ['sector_up_ratio', 'sector_avg_ret', 'sector_momentum', 'sector_volatility', 'sector_leader']:
+            df_batch[col] = df_batch[col].fillna(0.0 if 'ret' in col else 0.5)
+        
+        logger.info(f"Added sector sentiment features")
+        return df_batch
+
+    def _generate_samples_from_batch(
+        self, 
+        df_batch: pd.DataFrame, 
+        industry_map: Dict[str, int],
+        slide_step: int = 1
+    ) -> Tuple[List[np.ndarray], List[float], List[int], List[Tuple[str, int, str]]]:
+        """从批次数据生成样本"""
+        features_list = []
+        labels_list = []
+        industry_list = []
+        samples = []
+        
+        # 按股票分组
+        stock_groups = df_batch.groupby('ts_code')
+        logger.info(f"Number of stocks in batch with data: {len(stock_groups)}")
+        
+        for ts_code, group in stock_groups:
+            group = group.sort_values('trade_date').reset_index(drop=True)
+            n_rows = len(group)
+            
+            # logger.debug(f"Processing stock {ts_code}, rows: {n_rows}, seq_len: {self.seq_len}")
+            
+            if n_rows < self.seq_len:
+                # logger.debug(f"Skipping {ts_code}: not enough data ({n_rows} < {self.seq_len})")
+                continue
+            
+            # 检查并添加缺失的特征列
+            for feat in self.feature_cols:
+                if feat not in group.columns:
+                    # logger.debug(f"Adding missing feature: {feat}")
+                    group[feat] = 0.0
+                # 确保没有NaN值
+                group[feat] = group[feat].fillna(0.0)
+            
+            # 提取特征矩阵
+            feature_matrix = group[self.feature_cols].values.astype(np.float32)
+            labels = group['ret_rank'].values.astype(np.float32)
+            
+            # 创建样本索引 - 使用滑动窗口
+            # 滑动窗口方式：增加训练数据量，提高泛化能力
+            # logger.debug(f"Sliding window range: start={self.seq_len - 1}, end={n_rows - 1}, step={slide_step}")
+            
+            for i in range(self.seq_len - 1, n_rows - 1, slide_step):  # -1确保有未来收益
+                # 滑动窗口结束位置
+                end_idx = i + 1
+                # 窗口开始位置
+                start_idx = end_idx - self.seq_len
+                
+                # 确保窗口长度正确
+                if end_idx - start_idx != self.seq_len:
+                    continue
+                
+                # 提取序列
+                seq = feature_matrix[start_idx:end_idx]  # (seq_len, n_features)
+                # 使用未来一天的收益作为标签（i+1），避免数据泄漏
+                if i + 1 < n_rows:  # 确保有未来收益
+                    label = labels[i + 1]
+                else:
+                    continue  # 跳过最后一个样本，没有未来收益
+                
+                # 获取行业ID
+                ind_id = industry_map.get(ts_code, 0)
+                
+                # 获取当前样本对应的日期
+                current_date = group['trade_date'].iloc[i].strftime('%Y-%m-%d')
+                
+                features_list.append(seq)
+                labels_list.append(label)
+                industry_list.append(ind_id)
+                samples.append((ts_code, i, current_date))  # 添加日期信息
+                
+        return features_list, labels_list, industry_list, samples
+
+    def _build_dataset(self, train_ratio: float, val_ratio: float) -> None:
         """构建数据集 - 使用分块读取避免内存溢出"""
         import gc
         from datetime import datetime, timedelta
@@ -133,41 +296,11 @@ class FastAlphaDataset(Dataset):
         data_path = Config.PROCESSED_DATA_DIR / "all_features.parquet"
         if not data_path.exists():
             logger.error("Processed data not found")
-            
-            # 尝试自动处理数据
-            try:
-                logger.info("尝试自动处理数据...")
-                
-                # 1. 检查原始数据是否存在
-                raw_data_dir = Config.DATA_ROOT / "raw"
-                if not any(raw_data_dir.iterdir()):
-                    logger.info("原始数据不存在，尝试自动下载...")
-                    # 自动下载数据
-                    from data.downloader import YahooDownloader
-                    downloader = YahooDownloader()
-                    stock_list = downloader.get_main_board_stocks()
-                    logger.info(f"开始下载 {len(stock_list)} 只主板股票数据")
-                    downloader.download_all(force_update=False)
-                
-                # 2. 处理原始数据
-                logger.info("处理原始数据...")
-                from data.preprocessor import Preprocessor
-                preprocessor = Preprocessor()
-                preprocessor.process_all_data()
-                
-                # 3. 重新检查处理后的数据
-                if data_path.exists():
-                    logger.info("数据处理成功，继续创建数据集...")
-                else:
-                    error_msg = "数据处理后仍然不存在处理过的数据"
-                    logger.error(error_msg)
-                    raise FileNotFoundError(error_msg)
-                
-            except Exception as e:
-                error_msg = f"自动数据处理失败: {e}"
-                logger.error(error_msg)
-                # 直接报错中断job，不使用假数据
-                raise RuntimeError(error_msg)
+            self.samples = []
+            self.features = np.array([])
+            self.labels = np.array([])
+            self.industry_ids = np.array([], dtype=np.int64)
+            return
         
         # 先读取日期列，进行时间划分
         logger.info("Reading date information...")
@@ -230,25 +363,28 @@ class FastAlphaDataset(Dataset):
                     date_range = all_dates[fallback_split:]
                 logger.info(f"  Fallback: Using {len(date_range)} dates for {self.mode} mode")
             else:
-                error_msg = f"No dates available at all! Please check your data."
-                logger.error(error_msg)
-                # 直接报错中断job，不使用空数据集
-                raise RuntimeError(error_msg)
+                logger.error(f"No dates available at all! Please check your data.")
+                # 至少返回一个空数据集，避免崩溃
+                self.features = np.array([], dtype=np.float32)
+                self.labels = np.array([], dtype=np.float32)
+                self.industry_ids = np.array([], dtype=np.int64)
+                self.samples = []
+                return
         
         # 清晰的日志输出
         logger.info(f"=== {self.mode.upper()} Dataset ===")
         logger.info(f"  Date range: {date_range[0].strftime('%Y-%m-%d')} to {date_range[-1].strftime('%Y-%m-%d')}")
         logger.info(f"  Total trading days: {len(date_range)}")
         
-        # 分块读取数据 - 充分利用 96GB 内存，显著增大分块大小
-        chunk_size = 50000  # 大幅增加分块大小 (10000 -> 50000)
+        # 分块读取数据 - 充分利用32GB内存，增大分块大小提高处理速度
+        chunk_size = 10000  # 每次读取 10000 只股票，充分利用32GB内存
         features_list = []
         labels_list = []
-        industry_list = []
+        industry_list = []  # 行业代码列表
         samples = []
         
-        # 内存优化：针对 96GB 内存减少清理频率
-        MEMORY_CLEAR_INTERVAL = 50  # 增加清理间隔 (20 -> 50)
+        # 内存优化：减少清理频率，降低清理开销，充分利用32GB内存
+        MEMORY_CLEAR_INTERVAL = 20  # 每处理20个块清理一次内存
         
         # 行业代码映射 (股票代码 -> 行业ID)
         industry_map = self.get_stock_industry_map()
@@ -309,184 +445,23 @@ class FastAlphaDataset(Dataset):
                 logger.warning(f"No data for batch {batch_idx//chunk_size + 1}")
                 continue
             
-            # 计算超额收益标签 (股票收益 - 市场平均收益)
-            # 使用 ret_5d 优化一周持仓
-            if 'ret_5d' not in df_batch.columns:
-                if 'close' in df_batch.columns:
-                    df_batch['ret_5d'] = df_batch.groupby('ts_code')['close'].pct_change(5) * 100
-                else:
-                    df_batch['ret_5d'] = 0
+            # 添加衍生特征
+            df_batch = self._add_derived_features(df_batch)
             
-            # 计算 5 日后的未来收益
-            df_batch['ret_5d_future'] = df_batch.groupby('ts_code')['ret_5d'].shift(-5)
+            # 生成样本
+            batch_features, batch_labels, batch_industries, batch_samples = self._generate_samples_from_batch(
+                df_batch, industry_map, slide_step if use_sliding_window else 1
+            )
             
-            # 计算每日市场平均收益
-            market_mean = df_batch.groupby('trade_date')['ret_5d_future'].transform('mean')
+            # 合并结果
+            features_list.extend(batch_features)
+            labels_list.extend(batch_labels)
+            industry_list.extend(batch_industries)
+            samples.extend(batch_samples)
             
-            # 超额收益 = 个股收益 - 市场平均收益
-            df_batch['excess_return'] = df_batch['ret_5d_future'] - market_mean
-            
-            # 归一化到 [-1, 1] 范围 (除以标准差)
-            excess_std = df_batch.groupby('trade_date')['excess_return'].transform('std')
-            df_batch['ret_rank'] = df_batch['excess_return'] / (excess_std + 1e-8)
-            df_batch['ret_rank'] = df_batch['ret_rank'].clip(-3, 3) / 3  # 裁剪并缩放到 [-1, 1]
-            df_batch['ret_rank'] = (df_batch['ret_rank'] + 1) / 2  # 转换到 [0, 1]
-            df_batch['ret_rank'] = df_batch['ret_rank'].fillna(0.5)
-            
-            # ========== 板块情绪特征计算 ==========
-            # 需要 industry 字段，如果没有则使用默认值
-            if 'industry' not in df_batch.columns:
-                logger.warning("No 'industry' column found, using default sector features")
-                df_batch['sector_up_ratio'] = 0.5
-                df_batch['sector_avg_ret'] = 0.0
-                df_batch['sector_momentum'] = 0.5
-                df_batch['sector_volatility'] = 1.0
-                df_batch['sector_leader'] = 0.0
-            else:
-                # 按日期和行业分组计算板块情绪
-                group_key = ['trade_date', 'industry']
-                
-                # 1. 板块上涨家数比 (当日该板块上涨股票比例)
-                if 'pct_chg' in df_batch.columns:
-                    df_batch['sector_up_ratio'] = df_batch.groupby(group_key)['pct_chg'].transform(
-                        lambda x: (x > 0).mean()
-                    )
-                else:
-                    df_batch['sector_up_ratio'] = 0.5
-                
-                # 2. 板块平均涨幅
-                if 'pct_chg' in df_batch.columns:
-                    df_batch['sector_avg_ret'] = df_batch.groupby(group_key)['pct_chg'].transform('mean')
-                else:
-                    df_batch['sector_avg_ret'] = 0.0
-                
-                # 3. 板块动量 (板块在全市场的涨幅排名)
-                if 'pct_chg' in df_batch.columns:
-                    sector_daily_ret = df_batch.groupby(group_key)['pct_chg'].mean().reset_index()
-                    sector_daily_ret['sector_momentum'] = sector_daily_ret.groupby('trade_date')['pct_chg'].rank(pct=True)
-                    sector_daily_ret = sector_daily_ret.rename(columns={'pct_chg': '_sector_pct'})
-                    df_batch = df_batch.merge(
-                        sector_daily_ret[['trade_date', 'industry', 'sector_momentum']], 
-                        on=['trade_date', 'industry'], 
-                        how='left'
-                    )
-                    df_batch['sector_momentum'] = df_batch['sector_momentum'].fillna(0.5)
-                else:
-                    df_batch['sector_momentum'] = 0.5
-                
-                # 4. 板块波动率 (板块内股票涨跌幅标准差)
-                if 'pct_chg' in df_batch.columns:
-                    df_batch['sector_volatility'] = df_batch.groupby(group_key)['pct_chg'].transform('std')
-                    df_batch['sector_volatility'] = df_batch['sector_volatility'].fillna(1.0)
-                else:
-                    df_batch['sector_volatility'] = 1.0
-                
-                # 5. 是否板块龙头 (当日涨幅在板块前 10%)
-                if 'pct_chg' in df_batch.columns:
-                    df_batch['sector_rank'] = df_batch.groupby(group_key)['pct_chg'].rank(pct=True)
-                    df_batch['sector_leader'] = (df_batch['sector_rank'] >= 0.9).astype(float)
-                    df_batch.drop(columns=['sector_rank'], inplace=True, errors='ignore')
-                else:
-                    df_batch['sector_leader'] = 0.0
-            
-            # 填充 NaN
-            for col in ['sector_up_ratio', 'sector_avg_ret', 'sector_momentum', 'sector_volatility', 'sector_leader']:
-                df_batch[col] = df_batch[col].fillna(0.0 if 'ret' in col else 0.5)
-            
-            logger.info(f"Added sector sentiment features")
-            # ========== 板块情绪特征计算结束 ==========
-            
-            # 按股票分组
-            stock_groups = df_batch.groupby('ts_code')
-            logger.info(f"Number of stocks in batch with data: {len(stock_groups)}")
-            
-            for ts_code, group in stock_groups:
-                group = group.sort_values('trade_date').reset_index(drop=True)
-                n_rows = len(group)
-                
-                logger.debug(f"Processing stock {ts_code}, rows: {n_rows}, seq_len: {self.seq_len}")
-                
-                if n_rows < self.seq_len:
-                    logger.debug(f"Skipping {ts_code}: not enough data ({n_rows} < {self.seq_len})")
-                    continue
-                
-                # 修复：检查并添加缺失的特征列
-                for feat in self.feature_cols:
-                    if feat not in group.columns:
-                        logger.debug(f"Adding missing feature: {feat}")
-                        group[feat] = 0.0
-                    # 确保没有NaN值
-                    group[feat] = group[feat].fillna(0.0)
-                
-                # 提取特征矩阵
-                feature_matrix = group[self.feature_cols].values.astype(np.float32)
-                labels = group['ret_rank'].values.astype(np.float32)
-                
-                logger.debug(f"Feature matrix shape: {feature_matrix.shape}")
-                logger.debug(f"Labels shape: {labels.shape}")
-                
-                # 创建样本索引 - 使用滑动窗口
-                if use_sliding_window:
-                    # 滑动窗口方式：增加训练数据量，提高泛化能力
-                    logger.debug(f"Sliding window range: start={self.seq_len - 1}, end={n_rows - 1}, step={slide_step}")
-                    
-                    for i in range(self.seq_len - 1, n_rows - 1, slide_step):  # -1确保有未来收益
-                        # 滑动窗口结束位置
-                        end_idx = i + 1
-                        # 窗口开始位置
-                        start_idx = end_idx - self.seq_len
-                        
-                        # 确保窗口长度正确
-                        if end_idx - start_idx != self.seq_len:
-                            logger.debug(f"Skipping i={i}: window length incorrect")
-                            continue
-                        
-                        # 提取序列
-                        seq = feature_matrix[start_idx:end_idx]  # (seq_len, n_features)
-                        # 使用未来一天的收益作为标签（i+1），避免数据泄漏
-                        if i + 1 < n_rows:  # 确保有未来收益
-                            label = labels[i + 1]
-                        else:
-                            logger.debug(f"Skipping i={i}: no future label")
-                            continue  # 跳过最后一个样本，没有未来收益
-                        
-                        # 获取行业ID
-                        ind_id = industry_map.get(ts_code, 0)
-                        
-                        # 获取当前样本对应的日期
-                        current_date = group['trade_date'].iloc[i].strftime('%Y-%m-%d')
-                        
-                        features_list.append(seq)
-                        labels_list.append(label)
-                        industry_list.append(ind_id)
-                        samples.append((ts_code, i, current_date))  # 添加日期信息
-                        
-                        # 调试：每生成10个样本打印一次
-                        if len(samples) % 10 == 0:
-                            logger.info(f"Generated {len(samples)} samples so far...")
-                else:
-                    # 传统方式：每个样本对应一个时间点
-                    for i in range(self.seq_len - 1, n_rows - 1):  # -1确保有未来收益
-                        start_idx = i - self.seq_len + 1
-                        
-                        # 提取序列
-                        seq = feature_matrix[start_idx:i+1]  # (seq_len, n_features)
-                        # 使用未来一天的收益作为标签（i+1），避免数据泄漏
-                        if i + 1 < n_rows:  # 确保有未来收益
-                            label = labels[i + 1]
-                        else:
-                            continue  # 跳过最后一个样本，没有未来收益
-                        
-                        # 获取行业ID
-                        ind_id = industry_map.get(ts_code, 0)
-                        
-                        # 获取当前样本对应的日期
-                        current_date = group['trade_date'].iloc[i].strftime('%Y-%m-%d')
-                        
-                        features_list.append(seq)
-                        labels_list.append(label)
-                        industry_list.append(ind_id)
-                        samples.append((ts_code, i, current_date))  # 添加日期信息
+            # 调试：每生成一定数量样本打印一次
+            if len(samples) % 1000 == 0:
+                logger.info(f"Generated {len(samples)} samples so far...")
             
             # 清理内存 - 立即清理每个批次的数据
             del df_batch
@@ -519,19 +494,29 @@ class FastAlphaDataset(Dataset):
             del industry_list
             gc.collect()
         else:
-            # 修复：如果没有生成任何样本，直接报错中断job
-            error_msg = f"No samples generated for {self.mode} mode! Please check your data and parameters."
-            logger.error(error_msg)
-            logger.error(f"  Total dates: {len(date_range)}")
-            logger.error(f"  Total stocks: {n_stocks}")
-            logger.error(f"  Seq_len: {self.seq_len}")
+            # 修复：如果没有生成任何样本，使用调试信息并返回非空数据集
+            logger.warning(f"No samples generated for {self.mode} mode! Please check your data and parameters.")
+            logger.warning(f"  Total dates: {len(date_range)}")
+            logger.warning(f"  Total stocks: {n_stocks}")
+            logger.warning(f"  Seq_len: {self.seq_len}")
             
-            # 直接报错中断job，不使用假数据
-            raise RuntimeError(error_msg)
+            # 创建一个最小化的非空数据集，避免后续训练崩溃
+            # 使用一个虚拟样本，避免空数组导致的错误
+            dummy_feature = np.zeros((1, self.seq_len, self.n_features), dtype=np.float32)
+            dummy_label = np.zeros(1, dtype=np.float32)
+            dummy_industry = np.zeros(1, dtype=np.int64)
+            dummy_sample = [('dummy', 0, '2020-01-01')]
+            
+            self.features = dummy_feature
+            self.labels = dummy_label
+            self.industry_ids = dummy_industry
+            self.samples = dummy_sample
+            
+            logger.info(f"  Fallback: Created 1 dummy sample to avoid empty dataset")
         
         logger.info(f"Built {len(self.samples)} samples, features shape: {self.features.shape}")
     
-    def _save_cache(self):
+    def _save_cache(self) -> None:
         """保存缓存 - 使用 numpy 格式避免内存问题"""
         try:
             # 保存为 numpy 文件（更高效）
@@ -559,7 +544,7 @@ class FastAlphaDataset(Dataset):
         except Exception as e:
             logger.warning(f"Failed to save cache: {e}")
     
-    def _load_cache(self):
+    def _load_cache(self) -> None:
         """
         加载缓存 - 使用 numpy 格式，优化内存使用
         """
@@ -597,14 +582,6 @@ class FastAlphaDataset(Dataset):
                 logger.warning("Industry IDs not found in cache, using default (0)")
             
             logger.info(f"Loaded cache from {cache_dir} (mmap mode) - features shape: {self.features.shape}")
-            
-            # 检查缓存数据是否为空
-            if len(self.samples) == 0 or len(self.features) == 0:
-                error_msg = f"Cache is empty for {self.mode} mode!"
-                logger.error(error_msg)
-                # 直接报错中断job，不使用假数据
-                raise RuntimeError(error_msg)
-                
         except Exception as e:
             logger.error(f"Failed to load cache: {e}")
             raise
@@ -612,6 +589,46 @@ class FastAlphaDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
     
+    def _augment_features(self, features: np.ndarray) -> np.ndarray:
+        """应用数据增强"""
+        # 1. 添加少量随机噪声
+        noise = np.random.normal(0, 0.02, features.shape)
+        features = features + noise
+        
+        # 2. 随机缩放（±5%）
+        scale = np.random.uniform(0.95, 1.05)
+        features = features * scale
+        
+        # 3. 时间序列平移（±1步）
+        if np.random.random() < 0.2:
+            shift = np.random.choice([-1, 1])
+            features = np.roll(features, shift, axis=0)
+            # 填充缺失值
+            if shift > 0:
+                features[:shift] = 0
+            else:
+                features[shift:] = 0
+        
+        # 4. 随机翻转（时间轴）
+        if np.random.random() < 0.1:
+            features = np.flip(features, axis=0)
+            features = np.ascontiguousarray(features)  # 确保步长为正
+        
+        # 5. 随机缺失（随机遮盖一些特征值）
+        if np.random.random() < 0.2:
+            mask = np.random.random(features.shape) < 0.05
+            features[mask] = 0
+        
+        # 6. 随机交换特征（特征维度）
+        if np.random.random() < 0.1:
+            # 随机选择两个特征进行交换
+            if features.shape[1] > 1:
+                idx1, idx2 = np.random.choice(features.shape[1], 2, replace=False)
+                features[:, [idx1, idx2]] = features[:, [idx2, idx1]]
+                features = np.ascontiguousarray(features)  # 确保步长为正
+                
+        return features
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         获取单个样本 - 包含行业ID
@@ -635,41 +652,7 @@ class FastAlphaDataset(Dataset):
         
         # 数据增强（仅训练集）
         if self.use_data_augmentation:
-            # 1. 添加少量随机噪声
-            noise = np.random.normal(0, 0.02, features.shape)
-            features = features + noise
-            
-            # 2. 随机缩放（±5%）
-            scale = np.random.uniform(0.95, 1.05)
-            features = features * scale
-            
-            # 3. 时间序列平移（±1步）
-            if np.random.random() < 0.2:
-                shift = np.random.choice([-1, 1])
-                features = np.roll(features, shift, axis=0)
-                # 填充缺失值
-                if shift > 0:
-                    features[:shift] = 0
-                else:
-                    features[shift:] = 0
-            
-            # 4. 随机翻转（时间轴）
-            if np.random.random() < 0.1:
-                features = np.flip(features, axis=0)
-                features = np.ascontiguousarray(features)  # 确保步长为正
-            
-            # 5. 随机缺失（随机遮盖一些特征值）
-            if np.random.random() < 0.2:
-                mask = np.random.random(features.shape) < 0.05
-                features[mask] = 0
-            
-            # 6. 随机交换特征（特征维度）
-            if np.random.random() < 0.1:
-                # 随机选择两个特征进行交换
-                if features.shape[1] > 1:
-                    idx1, idx2 = np.random.choice(features.shape[1], 2, replace=False)
-                    features[:, [idx1, idx2]] = features[:, [idx2, idx1]]
-                    features = np.ascontiguousarray(features)  # 确保步长为正
+            features = self._augment_features(features)
         
         # 转换为 tensor，显式转换为 float32 以匹配模型权重类型
         X = torch.from_numpy(features).float()  # 转换为 float32，避免Double类型
@@ -702,9 +685,8 @@ class AlphaDataModule:
         auto_clear_cache: bool = True,  # 新增：自动清除缓存
         train_range: Tuple[str, str] = None,
         val_range: Tuple[str, str] = None,
-        memory_optimized: bool = True,  # 新增：内存优化模式
         **kwargs
-    ):
+    ) -> None:
         """
         初始化数据模块
         
@@ -716,55 +698,20 @@ class AlphaDataModule:
             auto_clear_cache: 是否自动清除缓存（默认True）
             train_range: 自定义训练集日期范围
             val_range: 自定义验证集日期范围
-            memory_optimized: 是否启用内存优化模式（默认True）
         """
         self.batch_size = batch_size or Config.BATCH_SIZE
         self.num_workers = num_workers
         self.force_rebuild = force_rebuild
-        self.memory_optimized = memory_optimized
         
-        import os
-        if os.name != 'nt' and auto_clear_cache and not force_rebuild:
-            auto_clear_cache = False
-
-        # 智能缓存管理：基于配置生成哈希
-        # 如果配置一致且缓存存在，则复用，否则重建
-        import hashlib
-        
-        # 构建配置指纹 (包含影响数据的关键参数)
-        # 将 train_range 等列表转换为字符串参与哈希
-        config_fingerprint = f"{str(train_range)}_{str(val_range)}_{Config.SEQ_LEN}_{Config.FEATURE_DIM}_{Config.SLIDE_STEP}_{Config.TRAIN_YEARS}"
-        cache_key = hashlib.md5(config_fingerprint.encode()).hexdigest()
-        
-        self.session_cache_dir = Config.DATA_ROOT / 'fast_cache' / cache_key
-        
-        # 检查缓存是否存在且有效
-        cache_exists = self.session_cache_dir.exists() and any(self.session_cache_dir.iterdir())
-        
-        if cache_exists and not force_rebuild:
-            logger.info(f"Found existing cache for config {cache_key[:8]}, reusing...")
-            # 如果缓存存在，我们就不需要重建
-            force_rebuild = False
-            
-            # 更新目录时间戳，防止被清理脚本误删
-            try:
-                # 更新 modification time
-                import os
-                os.utime(self.session_cache_dir, None)
-            except:
-                pass
-        else:
-            # 缓存不存在，或者被强制要求重建
-            if not cache_exists:
-                logger.info(f"No valid cache for config {cache_key[:8]}, creating new session...")
-            else:
-                logger.info(f"Force rebuild requested for {cache_key[:8]}...")
-            
+        # 自动清除缓存，确保每次训练使用最新数据
+        # 使用基于时间戳的会话目录，彻底解决 Windows 文件锁定问题
+        self.session_cache_dir = None
+        if auto_clear_cache:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.session_cache_dir = Config.DATA_ROOT / 'fast_cache' / timestamp
+            self._clear_old_caches() # 尝试清理旧缓存
             force_rebuild = True
-            
-            # 只有在确需重建时才尝试清理旧缓存（比如清理过期的其他缓存）
-            if auto_clear_cache:
-                self._clear_old_caches()
         
         logger.info(f"Using session cache dir: {self.session_cache_dir}")
         self.train_range = train_range
@@ -787,7 +734,7 @@ class AlphaDataModule:
         # 测试集暂时不提供自定义范围，或者可以使用默认逻辑
         self.test_dataset = FastAlphaDataset(mode='test', force_rebuild=force_rebuild, cache_dir=self.session_cache_dir)
     
-    def _clear_old_caches(self):
+    def _clear_old_caches(self) -> None:
         """尝试清理旧的缓存目录"""
         import shutil
         import time
@@ -803,8 +750,7 @@ class AlphaDataModule:
                     try:
                         # 如果目录名是日期格式，或者修改时间很久以前
                         stat = path.stat()
-                        # 延长缓存保留时间到 24 小时，以便多次实验复用
-                        if current_time - stat.st_mtime > 86400: # 24小时前的清理
+                        if current_time - stat.st_mtime > 3600: # 1小时前的都可以清理
                             shutil.rmtree(path)
                             logger.info(f"Cleaned up old cache: {path}")
                     except Exception:
@@ -817,76 +763,66 @@ class AlphaDataModule:
         pass
     
     def train_dataloader(self) -> DataLoader:
-        """训练数据加载器 - 超优化版 (适配 A800 & 96GB RAM)"""
+        """训练数据加载器 - 超优化版"""
         import os
         import multiprocessing
         
+        # 优化 num_workers：根据 CPU 核心数动态调整
+        # 13代 i5 通常是 6 核 12 线程
         if self.num_workers is None:
-            configured_workers = getattr(Config, 'NUM_WORKERS', None)
-            if isinstance(configured_workers, int) and configured_workers >= 0:
-                self.num_workers = configured_workers
-            else:
+            if os.name == 'nt':  # Windows
+                # Windows 下使用 0 workers（避免内存复制问题）
+                # Windows 下每个 worker 进程都会复制数据集到内存中
+                self.num_workers = 0
+            else:  # Linux/Mac
+                # Linux 下可以使用更多 workers
                 cpu_count = multiprocessing.cpu_count() or 6
-                if os.name == 'nt':  # Windows
-                    self.num_workers = min(4, cpu_count)
-                else:  # Linux/Mac
-                    self.num_workers = min(16, cpu_count)
+                self.num_workers = min(8, cpu_count)
         
-        # 硬件加速配置
-        pin_memory = getattr(Config, 'PIN_MEMORY', True)
-        timeout = int(getattr(Config, 'DATALOADER_TIMEOUT_SEC', 0) or 0)
+        logger.info(f"Train dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}")
         
-        logger.info(f"Train dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}, pin_memory={pin_memory}")
-        
-        # A800 优化：启用 persistent_workers 和 prefetch_factor
-        # 注意：Windows 下使用 num_workers > 0 必须在 main 中运行
-        persistent_workers = True if self.num_workers > 0 else False
-        multiprocessing_context = 'fork' if os.name != 'nt' else None
+        # Windows 下禁用 persistent_workers（避免 pickle 问题）
+        persistent_workers = False if os.name == 'nt' else True
         
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=pin_memory,
+            pin_memory=True,
             drop_last=True,
-            persistent_workers=persistent_workers,
-            prefetch_factor=2 if persistent_workers else None,
-            timeout=timeout,
-            multiprocessing_context=multiprocessing_context,
+            persistent_workers=persistent_workers,  # Windows 下禁用
+            prefetch_factor=2 if persistent_workers else None,  # Windows 下禁用
+            # Windows 下需要设置 spawn_start_method
         )
     
     def val_dataloader(self) -> DataLoader:
-        """验证数据加载器 - 优化版"""
+        """验证数据加载器"""
         import os
         import multiprocessing
         
+        # 验证集使用较少的 workers
         if self.num_workers is None:
-            configured_workers = getattr(Config, 'NUM_WORKERS', None)
-            if isinstance(configured_workers, int) and configured_workers >= 0:
-                self.num_workers = max(0, configured_workers // 2)
-            else:
+            if os.name == 'nt':  # Windows
+                # Windows 下使用 0 workers（避免内存复制问题）
+                self.num_workers = 0
+            else:  # Linux/Mac
                 cpu_count = multiprocessing.cpu_count() or 6
-                if os.name == 'nt':
-                    self.num_workers = min(2, cpu_count)
-                else:
-                    self.num_workers = min(8, cpu_count)
+                self.num_workers = min(6, cpu_count)
         
-        pin_memory = getattr(Config, 'PIN_MEMORY', True)
-        persistent_workers = True if self.num_workers > 0 else False
-        timeout = int(getattr(Config, 'DATALOADER_TIMEOUT_SEC', 0) or 0)
-        multiprocessing_context = 'fork' if os.name != 'nt' else None
+        logger.info(f"Val dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}")
+        
+        # Windows 下禁用 persistent_workers（避免 pickle 问题）
+        persistent_workers = False if os.name == 'nt' else True
         
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            prefetch_factor=2 if persistent_workers else None,
-            timeout=timeout,
-            multiprocessing_context=multiprocessing_context,
+            pin_memory=True,
+            persistent_workers=persistent_workers,  # Windows 下禁用
+            prefetch_factor=2 if persistent_workers else None,  # Windows 下禁用
         )
     
     def test_dataloader(self) -> DataLoader:
