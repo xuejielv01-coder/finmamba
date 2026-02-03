@@ -59,8 +59,7 @@ class FastAlphaDataset(Dataset):
         self.seq_len = Config.SEQ_LEN
         self.feature_cols = Preprocessor.FEATURES
         self.n_features = len(self.feature_cols)
-        # 添加数据增强标志
-        self.use_data_augmentation = mode == 'train'
+        self.use_data_augmentation = (mode == 'train') and getattr(Config, 'USE_DATA_AUGMENTATION', False)
         
         # 调试：打印特征列信息
         logger.info(f"Feature columns ({len(self.feature_cols)}): {self.feature_cols}")
@@ -759,6 +758,10 @@ class AlphaDataModule:
         self.force_rebuild = force_rebuild
         self.memory_optimized = memory_optimized
         
+        import os
+        if os.name != 'nt' and auto_clear_cache and not force_rebuild:
+            auto_clear_cache = False
+
         # 自动清除缓存，确保每次训练使用最新数据
         # 使用基于时间戳的会话目录，彻底解决 Windows 文件锁定问题
         self.session_cache_dir = None
@@ -823,23 +826,27 @@ class AlphaDataModule:
         import os
         import multiprocessing
         
-        # 优化 num_workers：在 96GB 内存下，Windows 也可以尝试开启少量 workers
         if self.num_workers is None:
-            cpu_count = multiprocessing.cpu_count() or 6
-            if os.name == 'nt':  # Windows
-                # Windows 下开启 4 个 worker，配合 persistent_workers
-                self.num_workers = min(4, cpu_count)
-            else:  # Linux/Mac
-                self.num_workers = min(8, cpu_count)
+            configured_workers = getattr(Config, 'NUM_WORKERS', None)
+            if isinstance(configured_workers, int) and configured_workers >= 0:
+                self.num_workers = configured_workers
+            else:
+                cpu_count = multiprocessing.cpu_count() or 6
+                if os.name == 'nt':  # Windows
+                    self.num_workers = min(4, cpu_count)
+                else:  # Linux/Mac
+                    self.num_workers = min(16, cpu_count)
         
         # 硬件加速配置
         pin_memory = getattr(Config, 'PIN_MEMORY', True)
+        timeout = int(getattr(Config, 'DATALOADER_TIMEOUT_SEC', 0) or 0)
         
         logger.info(f"Train dataloader: num_workers={self.num_workers}, batch_size={self.batch_size}, pin_memory={pin_memory}")
         
         # A800 优化：启用 persistent_workers 和 prefetch_factor
         # 注意：Windows 下使用 num_workers > 0 必须在 main 中运行
         persistent_workers = True if self.num_workers > 0 else False
+        multiprocessing_context = 'fork' if os.name != 'nt' else None
         
         return DataLoader(
             self.train_dataset,
@@ -850,6 +857,8 @@ class AlphaDataModule:
             drop_last=True,
             persistent_workers=persistent_workers,
             prefetch_factor=2 if persistent_workers else None,
+            timeout=timeout,
+            multiprocessing_context=multiprocessing_context,
         )
     
     def val_dataloader(self) -> DataLoader:
@@ -858,14 +867,20 @@ class AlphaDataModule:
         import multiprocessing
         
         if self.num_workers is None:
-            cpu_count = multiprocessing.cpu_count() or 6
-            if os.name == 'nt':
-                self.num_workers = min(2, cpu_count)
+            configured_workers = getattr(Config, 'NUM_WORKERS', None)
+            if isinstance(configured_workers, int) and configured_workers >= 0:
+                self.num_workers = max(0, configured_workers // 2)
             else:
-                self.num_workers = min(4, cpu_count)
+                cpu_count = multiprocessing.cpu_count() or 6
+                if os.name == 'nt':
+                    self.num_workers = min(2, cpu_count)
+                else:
+                    self.num_workers = min(8, cpu_count)
         
         pin_memory = getattr(Config, 'PIN_MEMORY', True)
         persistent_workers = True if self.num_workers > 0 else False
+        timeout = int(getattr(Config, 'DATALOADER_TIMEOUT_SEC', 0) or 0)
+        multiprocessing_context = 'fork' if os.name != 'nt' else None
         
         return DataLoader(
             self.val_dataset,
@@ -875,6 +890,8 @@ class AlphaDataModule:
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             prefetch_factor=2 if persistent_workers else None,
+            timeout=timeout,
+            multiprocessing_context=multiprocessing_context,
         )
     
     def test_dataloader(self) -> DataLoader:

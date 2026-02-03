@@ -270,10 +270,14 @@ class Trainer:
         
         import time
         epoch_batch_start = time.time()
+        first_batch_wait_start = epoch_batch_start
         
         for batch_idx, batch_data in enumerate(self.train_loader):
             if self._stop_flag:
                 break
+
+            if batch_idx == 0 and getattr(Config, 'LOG_FIRST_BATCH_TIMING', False):
+                logger.info(f"First batch fetched in {time.time() - first_batch_wait_start:.1f}s")
             
             # 解包批次数据 (支持新旧格式)
             if len(batch_data) == 4:
@@ -293,8 +297,11 @@ class Trainer:
             
             # A10 GPU优化：使用统一的autocast上下文
             with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                first_forward_start = time.time() if (batch_idx == 0 and getattr(Config, 'LOG_FIRST_BATCH_TIMING', False)) else None
                 pred = self.model(X, industry_ids)  # 传入行业ID
                 loss, loss_dict = self.criterion(pred, y)
+                if first_forward_start is not None:
+                    logger.info(f"First forward+loss took {time.time() - first_forward_start:.1f}s")
                 
                 # 梯度累积：缩放损失
                 loss = loss / self.grad_accum_steps
@@ -480,6 +487,41 @@ class Trainer:
         
         # 用于计算训练速度
         epoch_times = []
+
+        if getattr(Config, 'COMPILE_WARMUP', False) and getattr(Config, 'ENABLE_COMPILE', False) and self.device.type == 'cuda':
+            try:
+                import time as _time
+                warmup_start = _time.time()
+                batch_data = next(iter(self.train_loader))
+                if len(batch_data) == 4:
+                    X, y, industry_ids, _ = batch_data
+                    industry_ids = industry_ids.to(self.device, non_blocking=True)
+                else:
+                    X, y, _ = batch_data
+                    industry_ids = None
+
+                X = X.float().to(self.device, non_blocking=True)
+                y = y.float().to(self.device, non_blocking=True)
+
+                self.model.train()
+                self.optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                    pred = self.model(X, industry_ids)
+                    loss, _ = self.criterion(pred, y)
+
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                    self.optimizer.zero_grad(set_to_none=True)
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                logger.info(f"Compile warmup finished in {_time.time() - warmup_start:.1f}s")
+            except Exception as e:
+                logger.warning(f"Compile warmup failed: {e}")
         
         try:
             for epoch in range(self.max_epochs):

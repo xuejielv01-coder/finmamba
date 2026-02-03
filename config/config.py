@@ -90,7 +90,11 @@ class Config:
     USE_BF16 = True  # A800 完美支持 BF16
     ENABLE_COMPILE = True  # 启用 torch.compile
     PIN_MEMORY = True
-    NUM_WORKERS = 4  # Windows 建议 4-8
+    NUM_WORKERS = 8
+    DATALOADER_TIMEOUT_SEC = 180
+    USE_DATA_AUGMENTATION = False
+    COMPILE_WARMUP = True
+    LOG_FIRST_BATCH_TIMING = True
 
     # ============ SOTA Thresholds (Targeting IC > 0.2) ============
     SOTA_TARGET_IC = 0.20  # 提高目标 IC (0.055 -> 0.20)
