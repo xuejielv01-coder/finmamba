@@ -143,10 +143,11 @@ class FastAlphaDataset(Dataset):
                 if not any(raw_data_dir.iterdir()):
                     logger.info("原始数据不存在，尝试自动下载...")
                     # 自动下载数据
-                    from data.downloader import TushareDownloader
-                    downloader = TushareDownloader()
+                    from data.downloader import YahooDownloader
+                    downloader = YahooDownloader()
+                    stock_list = downloader.get_main_board_stocks()
+                    logger.info(f"开始下载 {len(stock_list)} 只主板股票数据")
                     downloader.download_all(force_update=False)
-                    downloader.download_index_data()
                 
                 # 2. 处理原始数据
                 logger.info("处理原始数据...")
@@ -158,27 +159,15 @@ class FastAlphaDataset(Dataset):
                 if data_path.exists():
                     logger.info("数据处理成功，继续创建数据集...")
                 else:
-                    raise FileNotFoundError("数据处理后仍然不存在处理过的数据")
+                    error_msg = "数据处理后仍然不存在处理过的数据"
+                    logger.error(error_msg)
+                    raise FileNotFoundError(error_msg)
                 
             except Exception as e:
-                logger.error(f"自动数据处理失败: {e}")
-                # 创建一个最小化的非空数据集，避免数据加载器创建失败
-                logger.warning("Creating fallback dataset with dummy data...")
-                
-                # 创建虚拟数据
-                dummy_seq_len = self.seq_len
-                dummy_features = np.zeros((1, dummy_seq_len, self.n_features), dtype=np.float32)
-                dummy_labels = np.zeros(1, dtype=np.float32)
-                dummy_industry = np.zeros(1, dtype=np.int64)
-                dummy_sample = [('dummy', 0, '2020-01-01')]
-                
-                self.features = dummy_features
-                self.labels = dummy_labels
-                self.industry_ids = dummy_industry
-                self.samples = dummy_sample
-                
-                logger.info(f"Fallback: Created 1 dummy sample to avoid empty dataset")
-                return
+                error_msg = f"自动数据处理失败: {e}"
+                logger.error(error_msg)
+                # 直接报错中断job，不使用假数据
+                raise RuntimeError(error_msg)
         
         # 先读取日期列，进行时间划分
         logger.info("Reading date information...")
@@ -241,13 +230,10 @@ class FastAlphaDataset(Dataset):
                     date_range = all_dates[fallback_split:]
                 logger.info(f"  Fallback: Using {len(date_range)} dates for {self.mode} mode")
             else:
-                logger.error(f"No dates available at all! Please check your data.")
-                # 至少返回一个空数据集，避免崩溃
-                self.features = np.array([], dtype=np.float32)
-                self.labels = np.array([], dtype=np.float32)
-                self.industry_ids = np.array([], dtype=np.int64)
-                self.samples = []
-                return
+                error_msg = f"No dates available at all! Please check your data."
+                logger.error(error_msg)
+                # 直接报错中断job，不使用空数据集
+                raise RuntimeError(error_msg)
         
         # 清晰的日志输出
         logger.info(f"=== {self.mode.upper()} Dataset ===")
@@ -533,25 +519,15 @@ class FastAlphaDataset(Dataset):
             del industry_list
             gc.collect()
         else:
-            # 修复：如果没有生成任何样本，使用调试信息并返回非空数据集
-            logger.warning(f"No samples generated for {self.mode} mode! Please check your data and parameters.")
-            logger.warning(f"  Total dates: {len(date_range)}")
-            logger.warning(f"  Total stocks: {n_stocks}")
-            logger.warning(f"  Seq_len: {self.seq_len}")
+            # 修复：如果没有生成任何样本，直接报错中断job
+            error_msg = f"No samples generated for {self.mode} mode! Please check your data and parameters."
+            logger.error(error_msg)
+            logger.error(f"  Total dates: {len(date_range)}")
+            logger.error(f"  Total stocks: {n_stocks}")
+            logger.error(f"  Seq_len: {self.seq_len}")
             
-            # 创建一个最小化的非空数据集，避免后续训练崩溃
-            # 使用一个虚拟样本，避免空数组导致的错误
-            dummy_feature = np.zeros((1, self.seq_len, self.n_features), dtype=np.float32)
-            dummy_label = np.zeros(1, dtype=np.float32)
-            dummy_industry = np.zeros(1, dtype=np.int64)
-            dummy_sample = [('dummy', 0, '2020-01-01')]
-            
-            self.features = dummy_feature
-            self.labels = dummy_label
-            self.industry_ids = dummy_industry
-            self.samples = dummy_sample
-            
-            logger.info(f"  Fallback: Created 1 dummy sample to avoid empty dataset")
+            # 直接报错中断job，不使用假数据
+            raise RuntimeError(error_msg)
         
         logger.info(f"Built {len(self.samples)} samples, features shape: {self.features.shape}")
     
@@ -624,21 +600,10 @@ class FastAlphaDataset(Dataset):
             
             # 检查缓存数据是否为空
             if len(self.samples) == 0 or len(self.features) == 0:
-                logger.warning(f"Cache is empty for {self.mode} mode! Creating fallback dataset...")
-                
-                # 创建虚拟数据
-                dummy_seq_len = self.seq_len
-                dummy_features = np.zeros((1, dummy_seq_len, self.n_features), dtype=np.float32)
-                dummy_labels = np.zeros(1, dtype=np.float32)
-                dummy_industry = np.zeros(1, dtype=np.int64)
-                dummy_sample = [('dummy', 0, '2020-01-01')]
-                
-                self.features = dummy_features
-                self.labels = dummy_labels
-                self.industry_ids = dummy_industry
-                self.samples = dummy_sample
-                
-                logger.info(f"Fallback: Created 1 dummy sample to avoid empty dataset")
+                error_msg = f"Cache is empty for {self.mode} mode!"
+                logger.error(error_msg)
+                # 直接报错中断job，不使用假数据
+                raise RuntimeError(error_msg)
                 
         except Exception as e:
             logger.error(f"Failed to load cache: {e}")
