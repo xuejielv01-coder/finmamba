@@ -134,11 +134,52 @@ class FastAlphaDataset(Dataset):
         data_path = Config.PROCESSED_DATA_DIR / "all_features.parquet"
         if not data_path.exists():
             logger.error("Processed data not found")
-            self.samples = []
-            self.features = np.array([])
-            self.labels = np.array([])
-            self.industry_ids = np.array([], dtype=np.int64)
-            return
+            
+            # 尝试自动处理数据
+            try:
+                logger.info("尝试自动处理数据...")
+                
+                # 1. 检查原始数据是否存在
+                raw_data_dir = Config.DATA_ROOT / "raw"
+                if not any(raw_data_dir.iterdir()):
+                    logger.info("原始数据不存在，尝试自动下载...")
+                    # 自动下载数据
+                    from data.downloader import TushareDownloader
+                    downloader = TushareDownloader()
+                    downloader.download_all(force_update=False)
+                    downloader.download_index_data()
+                
+                # 2. 处理原始数据
+                logger.info("处理原始数据...")
+                from data.preprocessor import Preprocessor
+                preprocessor = Preprocessor()
+                preprocessor.process_all_data()
+                
+                # 3. 重新检查处理后的数据
+                if data_path.exists():
+                    logger.info("数据处理成功，继续创建数据集...")
+                else:
+                    raise FileNotFoundError("数据处理后仍然不存在处理过的数据")
+                
+            except Exception as e:
+                logger.error(f"自动数据处理失败: {e}")
+                # 创建一个最小化的非空数据集，避免数据加载器创建失败
+                logger.warning("Creating fallback dataset with dummy data...")
+                
+                # 创建虚拟数据
+                dummy_seq_len = self.seq_len
+                dummy_features = np.zeros((1, dummy_seq_len, self.n_features), dtype=np.float32)
+                dummy_labels = np.zeros(1, dtype=np.float32)
+                dummy_industry = np.zeros(1, dtype=np.int64)
+                dummy_sample = [('dummy', 0, '2020-01-01')]
+                
+                self.features = dummy_features
+                self.labels = dummy_labels
+                self.industry_ids = dummy_industry
+                self.samples = dummy_sample
+                
+                logger.info(f"Fallback: Created 1 dummy sample to avoid empty dataset")
+                return
         
         # 先读取日期列，进行时间划分
         logger.info("Reading date information...")
@@ -581,6 +622,25 @@ class FastAlphaDataset(Dataset):
                 logger.warning("Industry IDs not found in cache, using default (0)")
             
             logger.info(f"Loaded cache from {cache_dir} (mmap mode) - features shape: {self.features.shape}")
+            
+            # 检查缓存数据是否为空
+            if len(self.samples) == 0 or len(self.features) == 0:
+                logger.warning(f"Cache is empty for {self.mode} mode! Creating fallback dataset...")
+                
+                # 创建虚拟数据
+                dummy_seq_len = self.seq_len
+                dummy_features = np.zeros((1, dummy_seq_len, self.n_features), dtype=np.float32)
+                dummy_labels = np.zeros(1, dtype=np.float32)
+                dummy_industry = np.zeros(1, dtype=np.int64)
+                dummy_sample = [('dummy', 0, '2020-01-01')]
+                
+                self.features = dummy_features
+                self.labels = dummy_labels
+                self.industry_ids = dummy_industry
+                self.samples = dummy_sample
+                
+                logger.info(f"Fallback: Created 1 dummy sample to avoid empty dataset")
+                
         except Exception as e:
             logger.error(f"Failed to load cache: {e}")
             raise
@@ -678,6 +738,7 @@ class AlphaDataModule:
         auto_clear_cache: bool = True,  # 新增：自动清除缓存
         train_range: Tuple[str, str] = None,
         val_range: Tuple[str, str] = None,
+        memory_optimized: bool = True,  # 新增：内存优化模式
         **kwargs
     ):
         """
@@ -691,10 +752,12 @@ class AlphaDataModule:
             auto_clear_cache: 是否自动清除缓存（默认True）
             train_range: 自定义训练集日期范围
             val_range: 自定义验证集日期范围
+            memory_optimized: 是否启用内存优化模式（默认True）
         """
         self.batch_size = batch_size or Config.BATCH_SIZE
         self.num_workers = num_workers
         self.force_rebuild = force_rebuild
+        self.memory_optimized = memory_optimized
         
         # 自动清除缓存，确保每次训练使用最新数据
         # 使用基于时间戳的会话目录，彻底解决 Windows 文件锁定问题

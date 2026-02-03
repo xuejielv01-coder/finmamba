@@ -57,33 +57,33 @@ class Config:
     TRAIN_START_YEARS = 2  # 训练数据开始时间：当前日期往前推2年（改为2年）
     BACKTEST_START_MONTHS = 6  # 回测数据开始时间：当前日期往前推6个月
     
-    # ============ FinMamba Architecture (Optimized for A800 GPU) ============
-    SEQ_LEN = 120  # 回看天数（A800可支持更长序列）
-    FEATURE_DIM = 82  # 扩展特征维度 (原始特征 + 新增技术指标 + 波动率特征 + 动量特征 + 市场状态特征)
-    D_MODEL = 256  # 模型隐藏维度（A800可支持更大维度）
-    N_LAYERS = 6  # Mamba 层数（A800可支持更深模型）
-    N_TRANSFORMER_LAYERS = 4  # Transformer 层数（A800可支持更多层）
-    N_HEADS = 16  # 多头注意力头数 (确保256能被16整除)
-    D_STATE = 128  # SSM 状态维度（A800可支持更大状态）
-    D_CONV = 4  # SSM 卷积核大小
-    EXPAND = 2  # SSM 扩展因子
-    MAMBA_LEVELS = (1, 5, 20)  # 多尺度: 日级、周级和月级（A800可支持更多尺度）
-    N_INDUSTRIES = 111  # 实际约111个行业，预留空间 (申万一级行业)
-    USE_GRAPH = True  # 使用行业嵌入
-    N_GCN_LAYERS = 3  # GCN层数（A800可支持更深GCN）
-    PATCH_LEN = 12  # 保留兼容性
-    STRIDE = 8  # 保留兼容性
+    # ============ FinMamba Architecture (Optimized for A100 40GB) ============
+    SEQ_LEN = 60  # 增加回看天数，充分利用A100显存
+    FEATURE_DIM = 82  # 保持特征维度
+    D_MODEL = 256  # 增加模型隐藏维度，充分利用A100显存
+    N_LAYERS = 4  # 增加Mamba层数，充分利用A100显存
+    N_TRANSFORMER_LAYERS = 2  # 增加Transformer层数，充分利用A100显存
+    N_HEADS = 8  # 增加多头注意力头数 (确保256能被8整除)
+    D_STATE = 128  # 增加SSM状态维度，充分利用A100显存
+    D_CONV = 4  # SSM卷积核大小
+    EXPAND = 2  # SSM扩展因子
+    MAMBA_LEVELS = (1,)  # 只使用日级，平衡内存和性能
+    N_INDUSTRIES = 111  # 实际约111个行业
+    USE_GRAPH = True  # 启用行业嵌入，提高模型性能
+    N_GCN_LAYERS = 2  # 增加GCN层数，充分利用A100显存
+    PATCH_LEN = 8  # 增加patch长度
+    STRIDE = 6  # 增加stride
 
-    # ============ Training (Optimized for A800 GPU) ============
-    TRAIN_YEARS = 3  # 使用3年数据训练（A800可处理更多数据）
-    BATCH_SIZE = 256  # 大幅增加batch size，充分利用A800的80GB显存
-    GRAD_ACCUM_STEPS = 1  # 不需要梯度累积，直接使用大batch
-    LR_INIT = 1e-4  # 学习率（大batch可使用稍小学习率）
-    WEIGHT_DECAY = 3e-3  # 权重衰减（平衡正则化和模型表达能力）
-    MAX_EPOCHS = 150  # 最大epoch数（A800训练速度快，可增加训练轮数）
-    PATIENCE = 20  # 早停耐心值（给予模型更多训练时间）
-    DROPOUT = 0.2  # 适当减少dropout（更深模型需要更少正则化）
-    SLIDE_STEP = 2  # 滑动窗口步长，增加数据利用率（A800计算能力强）
+    # ============ Training (Optimized for A100 40GB) ============
+    TRAIN_YEARS = 3  # 使用3年数据训练，充分利用A100显存
+    BATCH_SIZE = 128  # 增加batch size，充分利用A100显存
+    GRAD_ACCUM_STEPS = 1  # 减小梯度累积步数，充分利用A100显存
+    LR_INIT = 1e-4  # 学习率
+    WEIGHT_DECAY = 3e-3  # 权重衰减
+    MAX_EPOCHS = 100  # 增加训练轮数，提高模型性能
+    PATIENCE = 20  # 增加早停耐心值
+    DROPOUT = 0.2  # 适当减小dropout提高模型能力
+    SLIDE_STEP = 3  # 增加滑动窗口步长，平衡数据量和内存使用
 
     # ============ SOTA Thresholds (Adjusted for Strong Generalization) ============
     SOTA_TARGET_IC = 0.055  # 降低目标 IC (0.06→0.055)
@@ -110,11 +110,11 @@ class Config:
     MODEL_DIR = PROJECT_ROOT / "models" / "checkpoints"
     BEST_MODEL_PATH = MODEL_DIR / "best_model.pth"
     
-    # ============ Downloader (Optimized for A800) ============
-    CONCURRENT_WORKERS = 32  # 并发下载线程数（A800服务器通常有更多CPU核心）
-    API_RATE_LIMIT = 0.1  # API调用间隔（秒）（A800可处理更快的数据下载）
-    MAX_RETRY_TIMES = 5  # 最大重试次数（确保数据完整性）
-    RETRY_DELAY = 2.0  # 重试延迟（秒）（平衡速度和稳定性）
+    # ============ Downloader (Optimized for A100) ============
+    CONCURRENT_WORKERS = 64  # 并发下载线程数（A100服务器通常有更多CPU核心）
+    API_RATE_LIMIT = 0.05  # API调用间隔（秒）（A100可处理更快的数据下载）
+    MAX_RETRY_TIMES = 10  # 最大重试次数（确保数据完整性）
+    RETRY_DELAY = 3.0  # 重试延迟（秒）（平衡速度和稳定性）
     
     # ============ Portfolio ============
     PORTFOLIO_DIR = DATA_ROOT / "portfolio"

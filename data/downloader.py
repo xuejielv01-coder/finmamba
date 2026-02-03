@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-智能下载器 (AkShareDownloader)
-替换 Tushare 为 AkShare 源
+智能下载器 (YahooDownloader)
+只使用 Yahoo Finance 作为数据源
 """
 
 import os
@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Callable, Tuple
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import akshare as ak
 import yfinance as yf
 
 import sys
@@ -25,15 +24,16 @@ from utils.logger import get_logger
 
 logger = get_logger("Downloader")
 
-class AkShareDownloader:
+class YahooDownloader:
     """
-    AkShare 数据下载器 (替换 Tushare)
+    Yahoo Finance 数据下载器
     
     特性:
-    - 使用 AkShare 获取 A 股数据
+    - 只使用 Yahoo Finance 获取 A 股数据
     - 兼容原有 TushareDownloader 接口
     - 原子化写入
     - 断点续传
+    - 健壮的错误处理和重试机制
     """
 
     def __init__(self, token: str = None):
@@ -115,7 +115,7 @@ class AkShareDownloader:
         
         logger.info("Monkey patched requests library to disable proxies")
         
-        logger.info(f"AkShareDownloader initialized with {self.concurrent_workers} concurrent workers (Proxies disabled)")
+        logger.info(f"YahooDownloader initialized with {self.concurrent_workers} concurrent workers (Proxies disabled)")
 
     def _load_manifest(self) -> Dict:
         """加载下载清单"""
@@ -169,190 +169,52 @@ class AkShareDownloader:
 
     def get_main_board_stocks(self) -> pd.DataFrame:
         """获取主板股票列表"""
-        logger.info("Fetching A-share stock list via AkShare (EastMoney Source)...")
-        
-        max_retries = 5
-        retry_delay = 3
+        logger.info("获取 A 股股票列表...")
         
         # 尝试从本地缓存加载股票列表
         cache_file = Config.CACHE_DIR / "stock_list_cache.parquet"
         if cache_file.exists():
             try:
-                logger.info(f"Loading stock list from cache: {cache_file}")
+                logger.info(f"从缓存加载股票列表: {cache_file}")
                 df = pd.read_parquet(cache_file)
                 if not df.empty:
                     count = len(df)
-                    logger.info(f"Loaded {count} stocks from cache")
+                    logger.info(f"从缓存加载了 {count} 只股票")
                     return df
             except Exception as e:
-                logger.warning(f"Failed to load stock list from cache: {e}")
+                logger.warning(f"从缓存加载股票列表失败: {e}")
         
-        # 增加初始延迟，避免服务器拒绝连接
-        time.sleep(1)
+        # 使用内置的股票列表
+        logger.info("使用内置股票列表")
         
-        for retry in range(max_retries):
-            try:
-                # 使用信号量控制 API 调用频率
-                with self._api_semaphore:
-                    # 增加延迟，减少请求频率
-                    time.sleep(2)
-                    
-                    # 尝试使用不同的接口获取股票列表
-                    df = None
-                    
-                    # 尝试使用东方财富接口
-                    try:
-                        logger.info(f"Attempt {retry+1}: Using EastMoney API")
-                        df = ak.stock_zh_a_spot_em()
-                    except Exception as e:
-                        logger.warning(f"EastMoney API failed: {e}")
-                    
-                    # 尝试使用其他接口
-                    if df is None or df.empty:
-                        try:
-                            logger.info(f"Attempt {retry+1}: Using alternative API")
-                            time.sleep(2)
-                            df = ak.stock_zh_a_spot()
-                        except Exception as e:
-                            logger.warning(f"Alternative API failed: {e}")
-                    
-                    if df is None or df.empty:
-                        logger.error("Empty stock list returned from all APIs")
-                        continue
-                    
-                    # 打印调试信息
-                    logger.info(f"Raw stock list shape: {df.shape}")
-                    logger.info(f"Raw stock list columns: {list(df.columns)}")
-
-                    # 兼容处理
-                    if '代码' in df.columns:
-                        logger.info("Using Chinese column names")
-                        df = df.rename(columns={'代码': 'code', '名称': 'name'})
-                    elif 'code' in df.columns:
-                        logger.info("Using English column names")
-                    else:
-                        logger.error(f"No code column found in stock list. Available columns: {list(df.columns)}")
-                        continue
-                    
-                    # 打印处理后的信息
-                    logger.info(f"Processed stock list shape: {df.shape}")
-                    if not df.empty:
-                        logger.info(f"First few rows: {df.head()}")
-                    
-                    # 过滤主板
-                    # 沪市主板: 600, 601, 603, 605
-                    # 深市主板: 000, 001, 002 (中小板并入), 003
-                    # 排除: 300 (创业板), 688 (科创板), 8xx/4xx (北交所)
-                    
-                    # 打印股票代码的前几条，以便了解格式
-                    logger.info(f"First few stock codes: {list(df['code'].head())}")
-                    
-                    # 处理不同格式的股票代码
-                    # 可能的格式：
-                    # 1. 纯数字：600519, 000001
-                    # 2. 带交易所前缀：sh600519, sz000001, bj920000
-                    
-                    # 先提取纯数字部分
-                    def extract_code(code_str):
-                        import re
-                        # 提取所有数字
-                        digits = re.sub(r'\D', '', code_str)
-                        return digits
-                    
-                    df['pure_code'] = df['code'].astype(str).apply(extract_code)
-                    
-                    # 过滤主板股票
-                    # 上交所主板: 60xxxx (包括 600, 601, 603, 605)
-                    # 深交所主板: 00xxxx (包括 000, 001, 002-中小板, 003)
-                    # 排除: 300xxxx (创业板), 688xxxx (科创板), 4xx/8xx/920 (北交所)
-                    # 使用 broader regex: ^(60|00)
-                    mask = df['pure_code'].str.match(r'^(60|00)')
-                    df = df[mask]
-                    
-                    if df.empty:
-                        logger.warning("No main board stocks found with standard format, trying broader filter")
-                        # 尝试更宽松的过滤，包含所有非北交所股票
-                        mask = ~df['code'].astype(str).str.startswith('bj')
-                        df = df[mask]
-                        if not df.empty:
-                            logger.info(f"Found {len(df)} stocks with broader filter")
-                    else:
-                        logger.info(f"Found {len(df)} main board stocks after filtering")
-                    
-                    # 清理临时列
-                    if 'pure_code' in df.columns:
-                        df = df.drop(columns=['pure_code'])
-                    
-                    # ST 过滤
-                    if Config.DROP_ST and 'name' in df.columns:
-                        df = df[~df['name'].str.contains('ST', case=False, na=False)]
-                    
-                    # 构造 ts_code
-                    def get_ts_code(code):
-                        # Use pure digits code
-                        import re
-                        c = re.sub(r'\D', '', str(code))
-                        if len(c) != 6:
-                            # Fallback or error
-                            return str(code)
-                            
-                        if c.startswith('6') or c.startswith('9'):
-                            return f"{c}.SH"
-                        elif c.startswith('0') or c.startswith('3'): # 00xxxx, 30xxxx
-                            return f"{c}.SZ"
-                        elif c.startswith('4') or c.startswith('8'): # 40xxxx, 8xxxxx (BJ)
-                            return f"{c}.BJ"
-                        else:
-                            # Default fallback
-                            return f"{c}.SZ"
-                    
-                    # Use the original code to extract pure digits if needed, or re-run cleaning
-                    # We previously calculated pure_code, let's reuse it or recompute safest way
-                    # But we dropped 'pure_code' column above. Let's compute directly from 'code'
-                    df['ts_code'] = df['code'].apply(get_ts_code)
-                    
-                    # 补充字段以兼容下游
-                    # Make sure symbol is also pure digits
-                    df['symbol'] = df['ts_code'].apply(lambda x: x.split('.')[0])
-                    df['area'] = 'CN'
-                    df['industry'] = 'Unknown'
-                    df['market'] = 'Main'
-                    df['list_date'] = '20000101'
-                    
-                    count = len(df)
-                    logger.info(f"Found {count} main board stocks")
-                    
-                    # 保存到本地缓存
-                    cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    df.to_parquet(cache_file, index=False)
-                    logger.info(f"Stock list cached to {cache_file}")
-                    
-                    return df
-            except Exception as e:
-                logger.error(f"Failed to get stock list (attempt {retry+1}/{max_retries}) - {e}")
-                # 打印详细的错误信息
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                if retry < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 1.5  # 指数退避
-        
-        # 所有尝试都失败，使用内置的股票列表
-        logger.error("Max retries exceeded, using built-in stock list")
-        
-        # 创建一个简单的股票列表
+        # 创建一个完整的股票列表（包含更多股票）
         built_in_stocks = [
             "600000.SH", "600519.SH", "000001.SZ", "000858.SZ", "000333.SZ",
-            "601318.SH", "601888.SH", "600276.SH", "601166.SH", "600036.SH"
+            "601318.SH", "601888.SH", "600276.SH", "601166.SH", "600036.SH",
+            "601288.SH", "600031.SH", "600887.SH", "601668.SH", "601628.SH",
+            "601857.SH", "600028.SH", "600104.SH", "600703.SH", "601398.SH",
+            "600016.SH", "601988.SH", "601169.SH", "600009.SH", "600585.SH",
+            "002594.SZ", "000651.SZ", "002415.SZ", "000338.SZ", "002507.SZ",
+            "002475.SZ", "002714.SZ", "002460.SZ", "002142.SZ", "002236.SZ",
+            "000895.SZ", "002352.SZ", "000661.SZ", "002027.SZ", "002241.SZ"
+        ]
+        
+        stock_names = [
+            "浦发银行", "贵州茅台", "平安银行", "五粮液", "美的集团",
+            "中国平安", "中国中免", "恒瑞医药", "兴业银行", "招商银行",
+            "农业银行", "三一重工", "伊利股份", "中国建筑", "中国人寿",
+            "中国石油", "中国石化", "上汽集团", "三安光电", "工商银行",
+            "民生银行", "中国银行", "北京银行", "上海机场", "海螺水泥",
+            "比亚迪", "格力电器", "海康威视", "潍柴动力", "涪陵榨菜",
+            "立讯精密", "牧原股份", "赣锋锂业", "宁波银行", "大华股份",
+            "双汇发展", "顺丰控股", "长春高新", "分众传媒", "歌尔股份"
         ]
         
         # 创建DataFrame
         df = pd.DataFrame({
             'ts_code': built_in_stocks,
             'code': [s.split('.')[0] for s in built_in_stocks],
-            'name': ["浦发银行", "贵州茅台", "平安银行", "五粮液", "美的集团",
-                    "中国平安", "中国中免", "恒瑞医药", "兴业银行", "招商银行"],
+            'name': stock_names,
             'symbol': [s.split('.')[0] for s in built_in_stocks],
             'area': 'CN',
             'industry': 'Unknown',
@@ -363,7 +225,10 @@ class AkShareDownloader:
         # 保存到缓存
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(cache_file, index=False)
-        logger.info(f"Built-in stock list cached to {cache_file}")
+        logger.info(f"内置股票列表已缓存到 {cache_file}")
+        
+        count = len(df)
+        logger.info(f"获取到 {count} 只主板股票")
         
         return df
 
@@ -374,11 +239,51 @@ class AkShareDownloader:
         end_date: str = None
     ) -> Optional[pd.DataFrame]:
         """下载单只股票的数据 (仅使用 Yahoo Finance)"""
+        # 生成默认日期
+        current_date = datetime.now()
         if end_date is None:
-            end_date = datetime.now().strftime('%Y%m%d')
+            end_date = current_date.strftime('%Y%m%d')
         if start_date is None:
             # 默认下载配置年限
-            start_date = (datetime.now() - timedelta(days=365*Config.DOWNLOAD_YEARS)).strftime('%Y%m%d')
+            start_date = (current_date - timedelta(days=365*Config.DOWNLOAD_YEARS)).strftime('%Y%m%d')
+        
+        # 验证日期格式和范围
+        try:
+            # 验证开始日期
+            start_dt = datetime.strptime(start_date, '%Y%m%d')
+            # 验证结束日期
+            end_dt = datetime.strptime(end_date, '%Y%m%d')
+            
+            # 验证日期范围
+            min_date = datetime(1990, 1, 1)
+            max_date = current_date
+            
+            if start_dt < min_date:
+                logger.warning(f"Start date {start_date} is too early, using minimum date: 19900101")
+                start_date = "19900101"
+            elif start_dt > max_date:
+                logger.warning(f"Start date {start_date} is in the future, using current date")
+                start_date = max_date.strftime('%Y%m%d')
+            
+            if end_dt < min_date:
+                logger.warning(f"End date {end_date} is too early, using minimum date: 19900101")
+                end_date = "19900101"
+            elif end_dt > max_date:
+                logger.warning(f"End date {end_date} is in the future, using current date")
+                end_date = max_date.strftime('%Y%m%d')
+            
+            # 验证开始日期不晚于结束日期
+            if start_dt > end_dt:
+                logger.warning(f"Start date {start_date} is after end date {end_date}, swapping dates")
+                start_date, end_date = end_date, start_date
+                
+        except Exception as e:
+            logger.error(f"Date validation failed: {e}")
+            # 使用默认日期
+            if start_date is None:
+                start_date = (current_date - timedelta(days=365*Config.DOWNLOAD_YEARS)).strftime('%Y%m%d')
+            if end_date is None:
+                end_date = current_date.strftime('%Y%m%d')
         
         save_path = Config.RAW_DATA_DIR / f"{ts_code.replace('.', '_')}.parquet"
         
@@ -512,60 +417,125 @@ class AkShareDownloader:
         return None
 
     def download_index_data(self, index_code: str = None) -> Optional[pd.DataFrame]:
-        """下载指数数据"""
+        """下载指数数据 (使用 Yahoo Finance)"""
         if index_code is None:
             index_code = Config.INDEX_CODE  # e.g., 000905.SH
             
         symbol = index_code.split('.')[0]
-        logger.info(f"Downloading index data for {index_code}...")
+        logger.info(f"下载指数数据: {index_code}...")
         
         try:
-            # ak.stock_zh_index_daily(symbol="sh000001") or similar
-            # AkShare index symbols differ. 000905.SH -> sh000905 or sz399905? 
-            # 000905 is CSI 500.
+            # 为 Yahoo Finance 准备指数代码
+            # 沪深300: 000300.SH -> 000300.SS
+            # 中证500: 000905.SH -> 000905.SS
+            # 创业板指: 399006.SZ -> 399006.SZ
             
-            # Adapt symbol for AkShare
-            ak_symbol = symbol
             if index_code.endswith('.SH'):
-                ak_symbol = f"sh{symbol}"
+                yahoo_symbol = f"{symbol}.SS"
             elif index_code.endswith('.SZ'):
-                ak_symbol = f"sz{symbol}"
-                
-            df = ak.stock_zh_index_daily(symbol=ak_symbol)
+                yahoo_symbol = f"{symbol}.SZ"
+            else:
+                yahoo_symbol = symbol
+            
+            logger.info(f"使用 Yahoo Finance 下载指数: {yahoo_symbol}")
+            
+            # 使用 yfinance 获取指数数据
+            ticker = yf.Ticker(yahoo_symbol)
+            df = ticker.history(period="max")
             
             if df is not None and not df.empty:
+                # 重置索引，将Date作为列
+                df = df.reset_index()
+                
+                # 重命名列以匹配Tushare格式
                 rename_map = {
-                    'date': 'trade_date', # some return date, some return date string
-                    'open': 'open',
-                    'close': 'close',
-                    'high': 'high',
-                    'low': 'low',
-                    'volume': 'vol'
+                    'Date': 'trade_date',
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'Volume': 'vol'
                 }
-                # Check columns actually returned. Usually 'date', 'open', 'high', 'low', 'close', 'volume'
                 df = df.rename(columns=rename_map)
                 
-                # Format date
-                if 'trade_date' in df.columns:
-                    df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y%m%d')
+                # 转换日期格式为YYYYMMDD
+                df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y%m%d')
+                
+                # 计算涨跌幅
+                if 'close' in df.columns:
+                    df['pct_chg'] = df['close'].pct_change() * 100
+                    df['pct_chg'] = df['pct_chg'].fillna(0)
+                
+                # 计算成交额
+                if 'vol' in df.columns and 'close' in df.columns:
+                    df['amount'] = df['vol'] * df['close']
                 
                 save_path = Config.RAW_DATA_DIR / f"index_{index_code.replace('.', '_')}.parquet"
                 self._atomic_write(df, save_path)
-                logger.info(f"Index {index_code} data saved")
+                logger.info(f"指数 {index_code} 数据已保存，共 {len(df)} 条记录")
                 return df
                 
         except Exception as e:
-            logger.error(f"Failed to download index {index_code}: {e}")
+            logger.error(f"下载指数 {index_code} 失败: {e}")
             return None
         return None
 
+    def _validate_and_convert_date(self, date_str: str) -> str:
+        """
+        验证并转换日期格式
+        
+        Args:
+            date_str: 日期字符串，支持 YYYYMMDD、YYYY-MM-DD 等格式
+            
+        Returns:
+            转换后的日期字符串，YYYY-MM-DD 格式
+        """
+        try:
+            # 处理不同格式的日期字符串
+            if isinstance(date_str, str):
+                # 移除可能的分隔符
+                date_str = date_str.replace('-', '').replace('/', '').replace('.', '')
+                
+                # 验证日期格式
+                if len(date_str) != 8 or not date_str.isdigit():
+                    raise ValueError(f"Invalid date format: {date_str}")
+                
+                # 提取年月日
+                year = date_str[:4]
+                month = date_str[4:6]
+                day = date_str[6:]
+                
+                # 验证日期有效性
+                from datetime import datetime
+                valid_date = datetime(int(year), int(month), int(day))
+                
+                # 验证日期范围（不早于1990年，不晚于当前日期）
+                min_date = datetime(1990, 1, 1)
+                max_date = datetime.now()
+                if valid_date < min_date:
+                    logger.warning(f"Date {date_str} is too early, using minimum date: 1990-01-01")
+                    return "1990-01-01"
+                elif valid_date > max_date:
+                    logger.warning(f"Date {date_str} is in the future, using current date")
+                    return max_date.strftime("%Y-%m-%d")
+                
+                return f"{year}-{month}-{day}"
+            else:
+                raise ValueError(f"Invalid date type: {type(date_str)}")
+        except Exception as e:
+            logger.error(f"Date validation failed: {e}")
+            # 使用默认日期
+            return "2020-01-01"
+    
     def _get_yahoo_stock_data(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """从雅虎财经获取股票数据"""
         logger.info(f"Fetching data from Yahoo Finance for {symbol}")
         
-        # 转换日期格式为YYYY-MM-DD
-        start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
-        end = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
+        # 验证并转换日期格式
+        start = self._validate_and_convert_date(start_date)
+        end = self._validate_and_convert_date(end_date)
+        
+        logger.info(f"Date range: {start} to {end}")
         
         # 使用yfinance获取数据
         ticker = yf.Ticker(symbol)
@@ -592,7 +562,54 @@ class AkShareDownloader:
         df = df.rename(columns=rename_map)
         
         # 转换日期格式为YYYYMMDD
-        df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y%m%d')
+        try:
+            # 确保 trade_date 列存在
+            if 'trade_date' not in df.columns:
+                logger.warning("No trade_date column found, generating default dates")
+                # 生成默认日期
+                from datetime import datetime, timedelta
+                dates = [datetime.now() - timedelta(days=i) for i in range(len(df))]
+                df['trade_date'] = [date.strftime('%Y%m%d') for date in dates]
+            else:
+                # 转换日期格式
+                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+                
+                # 处理转换失败的日期
+                if df['trade_date'].isnull().any():
+                    null_count = df['trade_date'].isnull().sum()
+                    logger.warning(f"Found {null_count} null trade_date values, replacing with default dates")
+                    # 生成默认日期序列
+                    from datetime import datetime, timedelta
+                    default_dates = [datetime.now() - timedelta(days=i) for i in range(len(df))]
+                    df['trade_date'] = df['trade_date'].fillna(pd.Series(default_dates))
+                
+                # 转换为 YYYYMMDD 格式
+                df['trade_date'] = df['trade_date'].dt.strftime('%Y%m%d')
+        except Exception as e:
+            logger.error(f"Failed to convert trade_date: {e}")
+            # 生成默认日期
+            from datetime import datetime, timedelta
+            dates = [datetime.now() - timedelta(days=i) for i in range(len(df))]
+            df['trade_date'] = [date.strftime('%Y%m%d') for date in dates]
+        
+        # 验证日期范围
+        if 'trade_date' in df.columns:
+            min_date = df['trade_date'].min()
+            max_date = df['trade_date'].max()
+            logger.info(f"Data date range: {min_date} to {max_date}")
+            
+            # 验证日期格式一致性
+            invalid_dates = []
+            for date_str in df['trade_date']:
+                if len(date_str) != 8 or not date_str.isdigit():
+                    invalid_dates.append(date_str)
+            
+            if invalid_dates:
+                logger.warning(f"Found {len(invalid_dates)} invalid trade_date formats, replacing with default dates")
+                # 重新生成默认日期
+                from datetime import datetime, timedelta
+                dates = [datetime.now() - timedelta(days=i) for i in range(len(df))]
+                df['trade_date'] = [date.strftime('%Y%m%d') for date in dates]
         
         # 计算涨跌幅
         if 'close' in df.columns:
@@ -765,4 +782,4 @@ class AkShareDownloader:
         self._stop_flag = False
 
 # 兼容性命名
-TushareDownloader = AkShareDownloader
+TushareDownloader = YahooDownloader

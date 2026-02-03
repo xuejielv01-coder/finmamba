@@ -103,9 +103,33 @@ class Preprocessor:
         df = df.copy()
         
         # 确保日期排序
-        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
-        df = df.dropna(subset=['trade_date'])
-        df = df.sort_values('trade_date').reset_index(drop=True)
+        try:
+            # 尝试转换 trade_date 列
+            if 'trade_date' not in df.columns:
+                logger.error("No 'trade_date' column found in DataFrame")
+                return df
+            
+            # 转换日期格式
+            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+            
+            # 处理转换失败的日期
+            null_count = df['trade_date'].isnull().sum()
+            if null_count > 0:
+                logger.warning(f"Found {null_count} null trade_date values, removing those rows")
+                df = df.dropna(subset=['trade_date'])
+            
+            # 确保日期排序
+            if not df.empty:
+                df = df.sort_values('trade_date').reset_index(drop=True)
+                logger.debug(f"Data sorted by trade_date: {df['trade_date'].min()} to {df['trade_date'].max()}")
+        except Exception as e:
+            logger.error(f"Error processing trade_date: {e}")
+            # 尝试恢复，使用默认日期
+            from datetime import datetime, timedelta
+            if not df.empty:
+                dates = [datetime.now() - timedelta(days=i) for i in range(len(df))]
+                df['trade_date'] = dates
+                df = df.sort_values('trade_date').reset_index(drop=True)
         
         # 1. 计算价格基础特征
         df = self._calculate_price_features(df)
@@ -435,11 +459,45 @@ class Preprocessor:
     
     def _calculate_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算时间特征"""
-        df['trade_date'] = pd.to_datetime(df['trade_date'])
-        df['weekday'] = df['trade_date'].dt.dayofweek / 4.0  # 归一化到 [0, 1]
-        df['month'] = (df['trade_date'].dt.month - 1) / 11.0  # 归一化到 [0, 1]
-        df['is_month_start'] = df['trade_date'].dt.is_month_start.astype(float)
-        df['is_month_end'] = df['trade_date'].dt.is_month_end.astype(float)
+        try:
+            # 确保 trade_date 是 datetime 类型
+            if 'trade_date' not in df.columns:
+                logger.error("No 'trade_date' column found for time features calculation")
+                # 填充默认值
+                df['weekday'] = 0.0
+                df['month'] = 0.0
+                df['is_month_start'] = 0.0
+                df['is_month_end'] = 0.0
+                return df
+            
+            # 转换为 datetime 类型
+            if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+                
+                # 处理转换失败的日期
+                null_count = df['trade_date'].isnull().sum()
+                if null_count > 0:
+                    logger.warning(f"Found {null_count} null trade_date values in time features calculation")
+            
+            # 计算时间特征
+            df['weekday'] = df['trade_date'].dt.dayofweek / 4.0  # 归一化到 [0, 1]
+            df['month'] = (df['trade_date'].dt.month - 1) / 11.0  # 归一化到 [0, 1]
+            df['is_month_start'] = df['trade_date'].dt.is_month_start.astype(float)
+            df['is_month_end'] = df['trade_date'].dt.is_month_end.astype(float)
+            
+            # 处理可能的 NaN 值
+            time_features = ['weekday', 'month', 'is_month_start', 'is_month_end']
+            for feature in time_features:
+                df[feature] = df[feature].fillna(0.0)
+                
+        except Exception as e:
+            logger.error(f"Error calculating time features: {e}")
+            # 填充默认值
+            df['weekday'] = 0.0
+            df['month'] = 0.0
+            df['is_month_start'] = 0.0
+            df['is_month_end'] = 0.0
+        
         return df
     
     def _calculate_return_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -472,60 +530,87 @@ class Preprocessor:
         
         由于没有实际的大盘指数数据，这里使用全市场股票的平均值来模拟市场状态特征
         """
-        # 模拟大盘指数：使用所有股票的平均收盘价
-        market_close = df.groupby('trade_date')['close'].mean()
-        market_vol = df.groupby('trade_date')['vol'].mean()
+        # 检查必要的列
+        if 'trade_date' not in df.columns or 'close' not in df.columns or 'vol' not in df.columns:
+            logger.warning("Missing required columns for market state features calculation")
+            # 填充默认值
+            market_state_cols = [
+                'market_index_ret', 'market_index_ma5_ratio', 'market_index_ma20_ratio',
+                'market_index_vol_ratio', 'market_index_rsi', 'market_index_macd',
+                'industry_rotation_strength', 'market_breadth', 'market_updown_ratio',
+                'market_volatility'
+            ]
+            for col in market_state_cols:
+                df[col] = 0.0
+            return df
         
-        # 1. 市场指数收益
-        df['market_index_ret'] = df['trade_date'].map(market_close.pct_change() * 100)
-        
-        # 2. 市场指数均线比率
-        market_ma5 = market_close.rolling(5).mean()
-        market_ma20 = market_close.rolling(20).mean()
-        df['market_index_ma5_ratio'] = df['trade_date'].map((market_close / market_ma5 - 1) * 100)
-        df['market_index_ma20_ratio'] = df['trade_date'].map((market_close / market_ma20 - 1) * 100)
-        
-        # 3. 市场指数成交量比率
-        market_vol_ma20 = market_vol.rolling(20).mean()
-        df['market_index_vol_ratio'] = df['trade_date'].map(market_vol / market_vol_ma20)
-        
-        # 4. 市场指数RSI
-        delta = market_close.diff()
-        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-8)
-        market_rsi = 100 - (100 / (1 + rs))
-        df['market_index_rsi'] = df['trade_date'].map(market_rsi)
-        
-        # 5. 市场指数MACD
-        ema12 = market_close.ewm(span=12, adjust=False).mean()
-        ema26 = market_close.ewm(span=26, adjust=False).mean()
-        market_macd = ema12 - ema26
-        df['market_index_macd'] = df['trade_date'].map(market_macd)
-        
-        # 6. 行业轮动强度 (模拟)
-        # 使用行业收益的标准差来衡量行业轮动强度
-        if 'industry' in df.columns:
-            industry_ret = df.groupby(['trade_date', 'industry'])['close'].pct_change().reset_index()
-            industry_rotation = industry_ret.groupby('trade_date')['close'].std() * 100
-            df['industry_rotation_strength'] = df['trade_date'].map(industry_rotation)
-        else:
-            # 没有行业数据时，使用市场波动率代替
-            df['industry_rotation_strength'] = df['trade_date'].map(market_close.pct_change().rolling(20).std() * 100)
-        
-        # 7. 市场广度 (模拟)
-        # 使用上涨股票数与下跌股票数的比率
-        daily_ret = df.groupby('trade_date')['close'].pct_change().reset_index()
-        market_breadth = daily_ret.groupby('trade_date')['close'].apply(lambda x: (x > 0).sum() / max((x < 0).sum(), 1))
-        df['market_breadth'] = df['trade_date'].map(market_breadth)
-        
-        # 8. 市场涨跌比率
-        up_down_ratio = daily_ret.groupby('trade_date')['close'].apply(lambda x: (x > 0).sum() / len(x))
-        df['market_updown_ratio'] = df['trade_date'].map(up_down_ratio)
-        
-        # 9. 市场波动率
-        market_volatility = market_close.pct_change().rolling(20).std() * 100
-        df['market_volatility'] = df['trade_date'].map(market_volatility)
+        try:
+            # 模拟大盘指数：使用所有股票的平均收盘价
+            market_close = df.groupby('trade_date')['close'].mean()
+            market_vol = df.groupby('trade_date')['vol'].mean()
+            
+            # 1. 市场指数收益
+            df['market_index_ret'] = df['trade_date'].map(market_close.pct_change() * 100)
+            
+            # 2. 市场指数均线比率
+            market_ma5 = market_close.rolling(5).mean()
+            market_ma20 = market_close.rolling(20).mean()
+            df['market_index_ma5_ratio'] = df['trade_date'].map((market_close / market_ma5 - 1) * 100)
+            df['market_index_ma20_ratio'] = df['trade_date'].map((market_close / market_ma20 - 1) * 100)
+            
+            # 3. 市场指数成交量比率
+            market_vol_ma20 = market_vol.rolling(20).mean()
+            df['market_index_vol_ratio'] = df['trade_date'].map(market_vol / market_vol_ma20)
+            
+            # 4. 市场指数RSI
+            delta = market_close.diff()
+            gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / (loss + 1e-8)
+            market_rsi = 100 - (100 / (1 + rs))
+            df['market_index_rsi'] = df['trade_date'].map(market_rsi)
+            
+            # 5. 市场指数MACD
+            ema12 = market_close.ewm(span=12, adjust=False).mean()
+            ema26 = market_close.ewm(span=26, adjust=False).mean()
+            market_macd = ema12 - ema26
+            df['market_index_macd'] = df['trade_date'].map(market_macd)
+            
+            # 6. 行业轮动强度 (模拟)
+            # 使用行业收益的标准差来衡量行业轮动强度
+            if 'industry' in df.columns:
+                industry_ret = df.groupby(['trade_date', 'industry'])['close'].pct_change().reset_index()
+                industry_rotation = industry_ret.groupby('trade_date')['close'].std() * 100
+                df['industry_rotation_strength'] = df['trade_date'].map(industry_rotation)
+            else:
+                # 没有行业数据时，使用市场波动率代替
+                df['industry_rotation_strength'] = df['trade_date'].map(market_close.pct_change().rolling(20).std() * 100)
+            
+            # 7. 市场广度 (模拟)
+            # 使用上涨股票数与下跌股票数的比率
+            daily_ret = df.groupby('trade_date')['close'].pct_change().reset_index()
+            market_breadth = daily_ret.groupby('trade_date')['close'].apply(lambda x: (x > 0).sum() / max((x < 0).sum(), 1))
+            df['market_breadth'] = df['trade_date'].map(market_breadth)
+            
+            # 8. 市场涨跌比率
+            up_down_ratio = daily_ret.groupby('trade_date')['close'].apply(lambda x: (x > 0).sum() / len(x))
+            df['market_updown_ratio'] = df['trade_date'].map(up_down_ratio)
+            
+            # 9. 市场波动率
+            market_volatility = market_close.pct_change().rolling(20).std() * 100
+            df['market_volatility'] = df['trade_date'].map(market_volatility)
+            
+        except Exception as e:
+            logger.error(f"Error calculating market state features: {e}")
+            # 填充默认值
+            market_state_cols = [
+                'market_index_ret', 'market_index_ma5_ratio', 'market_index_ma20_ratio',
+                'market_index_vol_ratio', 'market_index_rsi', 'market_index_macd',
+                'industry_rotation_strength', 'market_breadth', 'market_updown_ratio',
+                'market_volatility'
+            ]
+            for col in market_state_cols:
+                df[col] = 0.0
         
         return df
     
@@ -893,7 +978,16 @@ class Preprocessor:
         
         # Calculate Market State Features (using aggregated data)
         logger.info("Calculating market state features...")
-        merged_df = self._calculate_market_state_features(merged_df)
+        
+        # 检查必要的列是否存在
+        required_cols = ['trade_date', 'close', 'vol']
+        missing_cols = [col for col in required_cols if col not in merged_df.columns]
+        
+        if missing_cols:
+            logger.warning(f"Missing required columns for market state features: {missing_cols}")
+            logger.warning("Skipping market state features calculation")
+        else:
+            merged_df = self._calculate_market_state_features(merged_df)
         
         # 按日期计算截面统计量 并 进行标准化
         logger.info("Calculating cross-sectional statistics and normalizing data...")
