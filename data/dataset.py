@@ -295,12 +295,27 @@ class FastAlphaDataset(Dataset):
         # 加载原始数据
         data_path = Config.PROCESSED_DATA_DIR / "all_features.parquet"
         if not data_path.exists():
-            logger.error("Processed data not found")
-            self.samples = []
-            self.features = np.array([])
-            self.labels = np.array([])
-            self.industry_ids = np.array([], dtype=np.int64)
-            return
+            logger.warning("Processed data not found. Starting automatic preprocessing...")
+            try:
+                preprocessor = Preprocessor()
+                # Run preprocessing and save to data_path
+                preprocessor.process_all_data(save_processed=True)
+                
+                # Check again if file exists
+                if not data_path.exists():
+                    logger.error("Preprocessing completed but data file still not found!")
+                    self.samples = []
+                    self.features = np.array([])
+                    self.labels = np.array([])
+                    self.industry_ids = np.array([], dtype=np.int64)
+                    return
+            except Exception as e:
+                logger.error(f"Automatic preprocessing failed: {e}")
+                self.samples = []
+                self.features = np.array([])
+                self.labels = np.array([])
+                self.industry_ids = np.array([], dtype=np.int64)
+                return
         
         # 先读取日期列，进行时间划分
         logger.info("Reading date information...")
