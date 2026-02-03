@@ -26,8 +26,13 @@ Thumbs.db
 data/raw/
 data/processed/
 data/cache/
+data/fast_cache/
 models/checkpoints/
 logs/
+
+# Python 编译文件
+__pycache__/
+*.pyc
 
 # 临时文件
 *.tmp
