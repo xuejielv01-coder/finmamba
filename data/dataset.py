@@ -762,15 +762,44 @@ class AlphaDataModule:
         if os.name != 'nt' and auto_clear_cache and not force_rebuild:
             auto_clear_cache = False
 
-        # 自动清除缓存，确保每次训练使用最新数据
-        # 使用基于时间戳的会话目录，彻底解决 Windows 文件锁定问题
-        self.session_cache_dir = None
-        if auto_clear_cache:
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.session_cache_dir = Config.DATA_ROOT / 'fast_cache' / timestamp
-            self._clear_old_caches() # 尝试清理旧缓存
+        # 智能缓存管理：基于配置生成哈希
+        # 如果配置一致且缓存存在，则复用，否则重建
+        import hashlib
+        
+        # 构建配置指纹 (包含影响数据的关键参数)
+        # 将 train_range 等列表转换为字符串参与哈希
+        config_fingerprint = f"{str(train_range)}_{str(val_range)}_{Config.SEQ_LEN}_{Config.FEATURE_DIM}_{Config.SLIDE_STEP}_{Config.TRAIN_YEARS}"
+        cache_key = hashlib.md5(config_fingerprint.encode()).hexdigest()
+        
+        self.session_cache_dir = Config.DATA_ROOT / 'fast_cache' / cache_key
+        
+        # 检查缓存是否存在且有效
+        cache_exists = self.session_cache_dir.exists() and any(self.session_cache_dir.iterdir())
+        
+        if cache_exists and not force_rebuild:
+            logger.info(f"Found existing cache for config {cache_key[:8]}, reusing...")
+            # 如果缓存存在，我们就不需要重建
+            force_rebuild = False
+            
+            # 更新目录时间戳，防止被清理脚本误删
+            try:
+                # 更新 modification time
+                import os
+                os.utime(self.session_cache_dir, None)
+            except:
+                pass
+        else:
+            # 缓存不存在，或者被强制要求重建
+            if not cache_exists:
+                logger.info(f"No valid cache for config {cache_key[:8]}, creating new session...")
+            else:
+                logger.info(f"Force rebuild requested for {cache_key[:8]}...")
+            
             force_rebuild = True
+            
+            # 只有在确需重建时才尝试清理旧缓存（比如清理过期的其他缓存）
+            if auto_clear_cache:
+                self._clear_old_caches()
         
         logger.info(f"Using session cache dir: {self.session_cache_dir}")
         self.train_range = train_range
@@ -809,7 +838,8 @@ class AlphaDataModule:
                     try:
                         # 如果目录名是日期格式，或者修改时间很久以前
                         stat = path.stat()
-                        if current_time - stat.st_mtime > 3600: # 1小时前的都可以清理
+                        # 延长缓存保留时间到 24 小时，以便多次实验复用
+                        if current_time - stat.st_mtime > 86400: # 24小时前的清理
                             shutil.rmtree(path)
                             logger.info(f"Cleaned up old cache: {path}")
                     except Exception:

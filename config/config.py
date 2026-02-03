@@ -76,7 +76,35 @@ class Config:
 
     # ============ Training (Optimized for A800 80GB & 96GB RAM) ============
     TRAIN_YEARS = 5  # 增加训练数据量 (3 -> 5)
-    BATCH_SIZE = 2048  # 大幅增加 batch size (256 -> 2048)
+    
+    def _get_adaptive_batch_size():
+        """根据显存大小自适应设置 Batch Size"""
+        default_bs = 512
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return 64
+            
+            # 获取 GPU 0 的显存大小 (GB)
+            # 注意：torch.cuda.get_device_properties 可能会初始化 CUDA 上下文
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            
+            # A800 80G -> 1024 (原 2048 在编译时容易 OOM)
+            if vram_gb > 70:
+                return 1024
+            # A100 40G / V100 32G -> 512
+            elif vram_gb > 30:
+                return 512
+            # 3090/4090 24G -> 256
+            elif vram_gb > 20:
+                return 256
+            # T4 16G / Others -> 128
+            else:
+                return 128
+        except Exception:
+            return default_bs
+
+    BATCH_SIZE = _get_adaptive_batch_size()  # 自适应 Batch Size
     GRAD_ACCUM_STEPS = 1  # A800 80GB 不需要梯度累积
     LR_INIT = 1e-4  # 增加学习率以适应大 batch (5e-5 -> 1e-4)
     WEIGHT_DECAY = 1e-2  
